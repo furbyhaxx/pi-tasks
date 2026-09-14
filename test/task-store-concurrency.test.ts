@@ -56,6 +56,17 @@ describe("TaskStore — shared file access", () => {
     expect(new TaskStore(file).list().map(t => t.subject)).toEqual(["From A", "From B"]);
   });
 
+  it("persists creation-time prerequisite edges for other sessions", () => {
+    const a = new TaskStore(file);
+    const prerequisite = a.create("Prerequisite", "d");
+    a.create("Dependent", "d", undefined, undefined, undefined, [prerequisite.id]);
+
+    const reopened = new TaskStore(file);
+    expect(reopened.get("2")?.blockedBy).toEqual([prerequisite.id]);
+    expect(reopened.get(prerequisite.id)?.blocks).toEqual(["2"]);
+    expect(reopened.getReadiness("2").ready).toBe(false);
+  });
+
   it("does not lose the other session's writes when both mutate the same task", () => {
     const a = new TaskStore(file);
     const b = new TaskStore(file);

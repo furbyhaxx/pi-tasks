@@ -407,9 +407,16 @@ export class TaskStore {
     activeForm?: string,
     metadata?: Record<string, any>,
     groupId?: string,
+    blockedBy: string[] = [],
   ): Task {
     return this.mutate(() => {
+      const prerequisiteIds = [...new Set(blockedBy)];
+      // A task without prerequisites introduces no edge into it, so it cannot close
+      // a cycle — skip the graph walk that every create would otherwise pay for.
+      const previousCycles = prerequisiteIds.length > 0 ? this.dependencyCycleNodes() : undefined;
       if (groupId) this.requireGroup(groupId);
+      // Validate before consuming an ID — a rejected create must leave no trace.
+      this.assertKnownTaskIds(prerequisiteIds);
       const now = Date.now();
       const task: Task = {
         id: String(this.nextId++),
@@ -421,11 +428,17 @@ export class TaskStore {
         groupId,
         metadata: metadata ?? {},
         blocks: [],
-        blockedBy: [],
+        blockedBy: prerequisiteIds,
         createdAt: now,
         updatedAt: now,
       };
       this.tasks.set(task.id, task);
+      for (const prerequisiteId of prerequisiteIds) {
+        const prerequisite = this.requireTask(prerequisiteId);
+        if (!prerequisite.blocks.includes(task.id)) prerequisite.blocks.push(task.id);
+      }
+      // A new task can still close a cycle through its group's prerequisites.
+      if (previousCycles) this.assertNoNewCycles(previousCycles);
       return cloneTask(task);
     });
   }

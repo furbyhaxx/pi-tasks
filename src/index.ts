@@ -717,59 +717,76 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "TaskCreate",
     label: "TaskCreate",
-    description: `Use this tool to create a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
-It also helps the user understand the progress of the task and overall progress of their requests.
+    description: `Use TaskCreate to turn work you are about to do into executable units: one useful outcome each, bounded in scope, carrying enough context to be picked up by a fresh agent, and finished against stated acceptance criteria.
 
 ## When to Use This Tool
 
-Use this tool proactively in these scenarios:
-
-- Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
-- Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
-- Plan mode - When using plan mode, create a task list to track the work
-- User explicitly requests todo list - When the user directly asks you to use the todo list
-- User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated). Create them all in one response with one TaskCreate call per task
-- After receiving new instructions - Immediately capture user requirements as tasks
-- When you start working on a task - Mark it as in_progress BEFORE beginning work
-- After completing a task - Mark it as completed and add any new follow-up tasks discovered during implementation
+- Work that spans several distinct steps, or that you want to hand off to subagents via TaskExecute
+- Work the user handed you as a list — create them all, one TaskCreate call per task
+- Work that must be coordinated: some parts can run concurrently, others must wait for a prerequisite
+- Requirements you want captured before you start, so progress survives a compaction or a new session
 
 ## When NOT to Use This Tool
 
-Skip using this tool when:
-- There is only a single, straightforward task
-- The task is trivial and tracking it provides no organizational benefit
-- The task can be completed in less than 3 trivial steps
-- The task is purely conversational or informational
+- Work you can finish inline in a couple of steps — just do it
+- Purely conversational or informational requests
+- Splitting a cohesive change into bookkeeping fragments (one task per file, per test, per tool call) — that adds tracking cost without adding a hand-off
 
-NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
+## What Makes a Good Task
+
+- **One outcome.** The task is done when one identifiable thing is true, not when a list of loosely related chores is finished.
+- **Bounded scope.** Name the files, area, or interface it may touch. Two tasks that will run at the same time must not write the same place — readiness says a task may start, not that it is safe to run beside another one. Nothing in this extension detects write conflicts or isolates workspaces.
+- **Self-contained.** The description is the entire briefing: goal, relevant paths, constraints, what must not be touched. Whoever executes it has not seen this conversation.
+- **Observable acceptance criteria.** State the evidence that ends the task — the command that must pass, the output that must appear, the behavior that must hold.
+- **Stated hand-off.** If a downstream task needs something from this one, say what to report back and where durable artifacts are written. Completion alone carries nothing.
+
+Granularity follows independent completion and hand-off value, not file or step counts. A coherent multi-file change is one task; a change whose second half depends on what the first half discovers is two.
+
+## Dependencies
+
+- \`blockedBy\` takes IDs of tasks that **already exist**. Create the prerequisites first, read the IDs off their results, then create the dependent task with those IDs. Never guess an ID, and never reference an ID returned by another call in the same batch — those results do not exist yet.
+- Several TaskCreate calls in one response are fine, and may share prerequisite IDs that were already returned by an earlier response.
+- Use TaskUpdate (addBlockedBy/addBlocks) for dependencies discovered after creation.
+- \`groupId\` is separate: a group gates all of its tasks behind every task of its prerequisite groups. Reserve groups for real all-to-all barriers; prefer per-task \`blockedBy\` for hand-offs between individual tasks.
+- Only add an edge for a real hand-off. Edges you add for tidiness serialize work that could have run concurrently.
+
+## Planning Depth
+
+Outline the work you understand and create tasks for it. Do not invent downstream tasks whose contract depends on findings you do not have yet — create them once the discovery task reports back, wiring them to the returned IDs.
 
 ## Task Fields
 
-- **subject**: A brief, actionable title in imperative form (e.g., "Fix authentication bug in login flow")
-- **description**: Detailed description of what needs to be done, including context and acceptance criteria
-- **activeForm** (optional): Present continuous form shown in the spinner when the task is in_progress (e.g., "Fixing authentication bug"). If omitted, the spinner shows the subject instead.
-- **groupId** (optional): Place the task in a task group. Its group prerequisites then gate this task.
+- **subject**: Brief, imperative title (e.g., "Fix authentication bug in login flow")
+- **description**: The full briefing — context, scope, acceptance criteria, expected hand-off
+- **activeForm** (optional): Present continuous form shown in the spinner while in_progress (e.g., "Fixing authentication bug")
+- **groupId** (optional): Place the task in a task group; the group's prerequisites then gate it
+- **blockedBy** (optional): Existing task IDs that must complete first
+- **agentType** (optional): Marks the task for subagent execution via TaskExecute (e.g., "general-purpose", "Explore")
 
 All tasks are created with status \`pending\`.
 
-## Tips
+## Example
 
-- Create tasks with clear, specific subjects that describe the outcome
-- Include enough detail in the description for another agent to understand and complete the task
-- After creating tasks, use TaskUpdate to set up dependencies (blocks/blockedBy) if needed
-- Check TaskList first to avoid creating duplicate tasks
-- Include \`agentType\` (e.g., "general-purpose", "Explore") to mark tasks for subagent execution via TaskExecute
-- To create several tasks at once, call TaskCreate multiple times in a single response — independent tool calls run in parallel, so the whole batch is created in one turn (one task per call).`,
+Fork/join, using observed IDs — the two extractions are independent and run side by side, only the consumer waits:
+
+\`\`\`
+TaskCreate {"subject": "Extract parser module", ...}   → Task #1 created
+TaskCreate {"subject": "Extract formatter module", ...} → Task #2 created
+(next response)
+TaskCreate {"subject": "Rewire CLI onto both modules", "blockedBy": ["1", "2"], ...}
+\`\`\``,
     promptGuidelines: [
-      "When working on complex multi-step tasks, use TaskCreate to track progress and TaskUpdate to update status.",
-      "Mark tasks as in_progress before starting work and completed when done.",
-      "Use TaskList to check for available work after completing a task.",
+      "For multi-step work, use TaskCreate to define bounded units with their own acceptance criteria, and TaskUpdate to keep status current.",
+      "Give each task everything its executor needs: goal, scope, files in and out of bounds, and the evidence that ends it.",
+      "Pass TaskCreate.blockedBy only IDs returned by earlier TaskCreate calls; add later-discovered edges with TaskUpdate.",
+      "Run ready tasks concurrently only when their write scopes are disjoint — TaskExecute provides no isolation.",
     ],
     parameters: Type.Object({
       subject: Type.String({ description: "A brief title for the task" }),
       description: Type.String({ description: "A detailed description of what needs to be done" }),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress (e.g., 'Running tests')" })),
       groupId: Type.Optional(Type.String({ description: "Task-group ID. Group prerequisites gate task starts." })),
+      blockedBy: Type.Optional(Type.Array(Type.String(), { description: "IDs of existing tasks that must complete before this one can start. Task IDs only — group prerequisites belong on the group, not here. Rejected as a whole if any ID is unknown or the edge would create a cycle." })),
       agentType: Type.Optional(Type.String({ description: "Agent type for subagent execution (e.g., 'general-purpose', 'Explore'). Tasks with agentType can be started via TaskExecute." })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
     }),
@@ -787,6 +804,7 @@ All tasks are created with status \`pending\`.
         params.activeForm,
         Object.keys(meta).length > 0 ? meta : undefined,
         params.groupId,
+        params.blockedBy,
       );
       widget.update();
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
@@ -807,8 +825,14 @@ All tasks are created with status \`pending\`.
 - To see what tasks are available to work on (status: 'pending', no owner, not blocked)
 - To check overall progress on the project
 - To find tasks that are blocked and need dependencies resolved
-- After completing a task, to check for newly unblocked work or claim the next available task
-- **Prefer working on tasks in ID order** (lowest ID first) when multiple tasks are available, as earlier tasks often set up context for later ones
+- After a task completes, to see what it released
+- When your picture of the list may be stale — after a hand-off, a cascade, or work by another session. Do not re-list state you just read.
+
+## Choosing What to Run Next
+
+- Pick a set of ready tasks whose write scopes do not overlap; prefer the ones that unblock the most downstream work. Ready means prerequisites are satisfied, not that two tasks are safe to run side by side.
+- Batch the delegable ones (those with \`agentType\`) into a single TaskExecute call. Tasks you keep for yourself are fine to run directly — not every ready task has to be delegated.
+- ID order is not a priority signal.
 
 ## Output
 
@@ -923,6 +947,7 @@ Returns full task details:
 ## Tips
 
 - After fetching a task, verify its effective task and group blockers are empty before beginning work.
+- Completed prerequisites keep their recorded result in metadata; TaskGet is how you read a hand-off that was too large to be injected in full.
 - Use TaskList to see all tasks in summary form.`,
     parameters: Type.Object({
       taskId: Type.String({ description: "The ID of the task to retrieve" }),
@@ -976,24 +1001,19 @@ Returns full task details:
 
 ## When to Use This Tool
 
-**Before starting work on a task:**
-- Mark it in_progress BEFORE beginning — do not start work without updating status first
-- After resolving, call TaskList to find your next task
+**Before starting work on a task yourself:**
+- Mark it in_progress BEFORE beginning. This is only needed for tasks you execute yourself — TaskExecute claims pending tasks on its own; do not pre-claim tasks you are about to delegate.
 
-**Mark tasks as resolved:**
-- When you have completed the work described in a task
-- When a task is no longer needed or has been superseded
-- IMPORTANT: Always mark your assigned tasks as resolved when you finish them
-- After resolving, call TaskList to find your next task
-
-- ONLY mark a task as completed when you have FULLY accomplished it
-- If you encounter errors, blockers, or cannot finish, keep the task as in_progress
-- When blocked, create a new task describing what needs to be resolved
+**Mark tasks as completed:**
+- Only once the task's acceptance criteria are actually met and you have the evidence — the command passed, the behavior holds. A completion event is a status change, not a verification.
+- Record what downstream tasks need (result summary, artifact paths) in \`metadata.result\` as part of completing it.
+- If you cannot finish, keep it in_progress and create a task for what is in the way
 - Never mark a task as completed if:
   - Tests are failing
   - Implementation is partial
   - You encountered unresolved errors
   - You couldn't find necessary files or dependencies
+- After completing a task, check TaskList for work it released
 
 **Delete tasks:**
 - When a task is no longer relevant or was created in error
@@ -1024,7 +1044,7 @@ Use \`deleted\` to permanently remove a task.
 
 ## Staleness
 
-Make sure to read a task's latest state using \`TaskGet\` before updating it.
+Read a task's latest state with \`TaskGet\` before updating it when your view may be out of date — after a delegated run, a cascade, or concurrent work by another session. Skip the round trip when you just read or wrote the task yourself.
 
 ## Examples
 
@@ -1278,9 +1298,18 @@ Set up task dependencies:
 - **task_ids**: Array of task IDs to execute
 - **additional_context**: Extra context appended to each agent's prompt
 - **model**: Model override for agents (e.g., "sonnet", "haiku")
-- **max_turns**: Maximum turns per agent`,
+- **max_turns**: Maximum turns per agent
+
+## Behavior
+
+- Pass every task you want started in one call. TaskExecute claims each pending task itself and launches them in the background; it returns immediately with a per-task line. Tasks that are blocked, non-pending or missing an agentType are reported as skipped — the batch is not rejected.
+- Agents run concurrently with no isolation between them. Only batch tasks whose write scopes are disjoint.
+- Do not poll for results. Continue with independent work; completion updates the task. Use TaskOutput when you actually need a specific agent's output, and TaskStop to end one early.
+- A completed prerequisite's recorded result is injected into a dependent task's prompt, truncated at 4,000 characters, and only for direct task prerequisites — not for group prerequisites. Anything larger belongs in a durable artifact whose path the result names.
+- Cascade (launching released tasks automatically on completion) is off unless the user enabled it, only covers tasks with an agentType, and only fires for tasks a completion just released. Launch the rest explicitly.`,
     promptGuidelines: [
       "Never use the Agent tool for tasks launched via TaskExecute — agents are already running.",
+      "Launch a batch of non-conflicting ready tasks in one TaskExecute call, then keep working instead of polling.",
     ],
     parameters: Type.Object({
       task_ids: Type.Array(Type.String(), { description: "Task IDs to execute as subagents" }),

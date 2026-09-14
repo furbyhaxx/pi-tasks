@@ -148,6 +148,38 @@ describe("TaskStore (in-memory)", () => {
     expect(task.metadata).toEqual({ a: 1, c: 3, d: 4 });
   });
 
+  it("creates tasks without prerequisites by default", () => {
+    const task = store.create("Standalone", "Desc");
+    expect(task.blockedBy).toEqual([]);
+    expect(store.getReadiness(task.id)).toEqual({ ready: true, blockers: [] });
+  });
+
+  it("creates a task with reciprocal, deduplicated prerequisite edges", () => {
+    const a = store.create("A", "Desc");
+    const b = store.create("B", "Desc");
+
+    const dependent = store.create("C", "Desc", undefined, undefined, undefined, [a.id, b.id, a.id]);
+
+    expect(dependent.blockedBy).toEqual([a.id, b.id]);
+    expect(store.get(a.id)!.blocks).toEqual([dependent.id]);
+    expect(store.get(b.id)!.blocks).toEqual([dependent.id]);
+    expect(store.getReadiness(dependent.id).ready).toBe(false);
+
+    store.update(a.id, { status: "completed" });
+    store.update(b.id, { status: "completed" });
+    expect(store.getReadiness(dependent.id)).toEqual({ ready: true, blockers: [] });
+  });
+
+  it("rejects creation-time prerequisites that do not exist without consuming an ID", () => {
+    store.create("Real", "Desc");
+
+    expect(() => store.create("Dependent", "Desc", undefined, undefined, undefined, ["9999"]))
+      .toThrow("does not exist");
+
+    expect(store.list()).toHaveLength(1);
+    expect(store.create("Next", "Desc").id).toBe("2");
+  });
+
   it("sets up bidirectional blocks via addBlocks", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");

@@ -106,6 +106,39 @@ describe("task-group tools and execution gates", () => {
     expect(list.content[0].text).not.toContain("hidden completed task");
   });
 
+  it("gates a task created with blockedBy until its prerequisites complete", async () => {
+    // IDs come back from the create calls; nothing predicts them.
+    const first = await mock.executeTool("TaskCreate", {
+      subject: "Schema", description: "Do schema", agentType: "general-purpose",
+    });
+    const prerequisiteId = /#(\d+)/.exec(first.content[0].text)?.[1] as string;
+    const second = await mock.executeTool("TaskCreate", {
+      subject: "Wire it up",
+      description: "Depends on the schema",
+      agentType: "general-purpose",
+      blockedBy: [prerequisiteId],
+    });
+    const dependentId = /#(\d+)/.exec(second.content[0].text)?.[1] as string;
+
+    expect((await mock.executeTool("TaskGet", { taskId: prerequisiteId })).content[0].text)
+      .toContain(`Blocks: #${dependentId}`);
+    const blocked = await mock.executeTool("TaskExecute", { task_ids: [dependentId] });
+    expect(blocked.content[0].text).toContain(`#${dependentId}: blocked by #${prerequisiteId}`);
+
+    await mock.executeTool("TaskUpdate", { taskId: prerequisiteId, status: "completed" });
+    // Cascade is enabled in this suite and a TaskExecute already ran, so completing
+    // the prerequisite launches the released task without a second explicit call.
+    await flush();
+    expect(rpc.spawned.map(spawn => spawn.prompt.includes("Wire it up"))).toContain(true);
+  });
+
+  it("rejects a TaskCreate whose prerequisite does not exist", async () => {
+    await expect(mock.executeTool("TaskCreate", {
+      subject: "Dependent", description: "d", blockedBy: ["9999"],
+    })).rejects.toThrow("does not exist");
+    expect((await mock.executeTool("TaskList", {})).content[0].text).toContain("No tasks found");
+  });
+
   it("updates and deletes groups without deleting their tasks", async () => {
     await createGroup("Old");
     await createTask("Work", "g1");

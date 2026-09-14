@@ -108,12 +108,23 @@ Create a structured task. Used proactively for complex multi-step work.
 | `description` | string | yes | Detailed context and acceptance criteria |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., "Running tests") |
 | `groupId` | string | no | Group membership; the group's prerequisites gate this task |
+| `blockedBy` | string[] | no | IDs of **existing** tasks that must complete before this one can start |
 | `agentType` | string | no | Agent type for subagent execution (e.g., `"general-purpose"`, `"Explore"`) |
 | `metadata` | object | no | Arbitrary key-value pairs |
 
 ```
 → Task #1 created successfully: Fix authentication bug
 ```
+
+`blockedBy` takes task IDs, not group IDs — create the prerequisites first, then use the IDs they returned:
+
+```
+TaskCreate {"subject": "Extract parser module", …}                        → Task #1
+TaskCreate {"subject": "Extract formatter module", …}                     → Task #2
+TaskCreate {"subject": "Rewire CLI", "blockedBy": ["1", "2"], …}          → Task #3
+```
+
+Edges are reciprocal (#1 and #2 gain `blocks: ["3"]`) and duplicates collapse. An unknown ID, or an edge that would close a cycle — including one formed through group membership — rejects the whole call: no task is created and no ID is consumed. Dependencies discovered later are added with [`TaskUpdate`](#taskupdate).
 
 ### `TaskList`
 
@@ -220,7 +231,7 @@ Tasks are created as `pending`. Starting a task is rejected while any task or gr
 
 ## Dependency Management
 
-- **Bidirectional edges:** `addBlocks`/`addBlockedBy` maintain both sides automatically
+- **Bidirectional edges:** `TaskCreate`'s `blockedBy` and `TaskUpdate`'s `addBlocks`/`addBlockedBy` maintain both sides automatically
 - **Validated edges:** new cycles, self-dependencies, and references to non-existent tasks are rejected atomically
 - **Group barriers:** group `blockedBy` edges gate every task in the downstream group until the complete transitive prerequisite chain is done
 - **Central readiness:** tools, `/tasks`, subagent execution, and auto-cascade use the same readiness calculation

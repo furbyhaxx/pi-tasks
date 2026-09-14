@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`TaskCreate` accepts `blockedBy` at creation time.** A dependent task can now be created already wired to the prerequisites it needs, instead of a create followed by a `TaskUpdate` that could leave a task briefly runnable. It takes IDs of tasks that already exist — the ones earlier calls returned, never a predicted ID — writes both sides of each edge, deduplicates, and rejects the whole call atomically when an ID is unknown or the edge would close a cycle, including one formed through group membership.
+
 - **Dependency-gated task groups with retained completion history.** `TaskGroupCreate` and `TaskGroupUpdate` add one organizational level whose prerequisite groups gate every downstream task, with cycle validation shared across task and group edges. Automatic cleanup now hides completed tasks instead of deleting their descriptions, results, memberships, and dependency links; history remains available through `TaskList(includeHidden: true)` and `/tasks`, while explicit deletion remains permanent.
+
+### Changed
+
+- **Task tool guidance rewritten around executable work units.** The model-facing descriptions framed tasks as a progress display; they now define a task by one outcome, a bounded write scope, a briefing complete enough for an agent that has not seen the conversation, and the evidence that ends it. They also stop implying behavior the extension does not have: readiness is not conflict detection, `TaskExecute` provides no isolation, auto-cascade is opt-in and only covers agent-backed tasks a completion just released, and prerequisite results reach a dependent prompt only for direct task edges, truncated. `TaskList`'s lowest-ID-first preference is gone in favor of picking a non-conflicting ready set.
 
 ## [0.9.0] - 2026-08-24
 

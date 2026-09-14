@@ -74,6 +74,21 @@ describe("TaskStore task groups", () => {
     expect(store.get("1")?.blockedBy).toEqual([]);
   });
 
+  it("rejects a new task whose creation-time prerequisite closes a group cycle", () => {
+    // B depends on A, so every A task effectively precedes every B task. A new A
+    // task declaring an existing B task as its prerequisite closes that loop.
+    const store = new TaskStore();
+    const a = store.createGroup("A");
+    const b = store.createGroup("B", undefined, [a.id]);
+    const inB = store.create("Task B", "d", undefined, undefined, b.id);
+
+    expect(() => store.create("Task A", "d", undefined, undefined, a.id, [inB.id]))
+      .toThrow("Dependency cycle");
+    expect(store.list().map(task => task.id)).toEqual([inB.id]);
+    expect(store.get(inB.id)?.blocks).toEqual([]);
+    expect(store.create("Task A", "d", undefined, undefined, a.id).id).toBe("2");
+  });
+
   it("retains hidden completed tasks, results, edges, and group progress", () => {
     const store = new TaskStore();
     const group = store.createGroup("Phase");
