@@ -41,12 +41,12 @@ The extension renders a persistent widget above the editor:
 
 ```
 ● 4 tasks in 2 groups (1 done, 1 in progress, 2 open)
-  g1 Design (1/2 completed, 0 hidden)
-  ✔ #1 Design the flux capacitor
-  ✳ #2 Acquiring plutonium… (2m 49s · ↑ 4.1k ↓ 1.2k)
-  g2 Validation (0/2 completed, 0 hidden) — blocked: group g1
-  ◻ #3 Install flux capacitor in DeLorean › blocked by group g1
-  ◻ #4 Test time travel at 88 mph › blocked by group g1
+  ✳ G1 Design (1/2 completed)
+    ✔ #1 Design the flux capacitor
+    ✳ #2 Acquiring plutonium… (2m 49s · ↑ 4.1k ↓ 1.2k)
+  ◻ G2 Validation (0/2 completed) › blocked by G1
+    ◻ #3 Install flux capacitor in DeLorean › blocked by G1
+    ◻ #4 Test time travel at 88 mph › blocked by G1
 ```
 
 | Glyph | Meaning |

@@ -40,19 +40,24 @@ describe("grouped task widget", () => {
     vi.useRealTimers();
   });
 
-  it("shows group progress and indented children in dependency order", () => {
+  it("renders grouped hierarchy with compact ID-only blockers", () => {
     const design = store.createGroup("Design");
     const build = store.createGroup("Build", undefined, [design.id]);
+    const verify = store.createGroup("Verify", undefined, [build.id]);
     store.create("Specify", "d", undefined, undefined, design.id);
     store.create("Implement", "d", undefined, undefined, build.id);
+    store.update("2", { addBlockedBy: ["1"] });
+    store.create("Check", "d", undefined, undefined, verify.id);
     widget.update();
 
-    const lines = render(view.widgets, view.theme);
-    expect(lines.findIndex(line => line.includes("g1 Design")))
-      .toBeLessThan(lines.findIndex(line => line.includes("g2 Build")));
-    expect(lines.join("\n")).toContain("0/1 completed");
-    expect(lines.join("\n")).toContain("blocked: group g1");
-    expect(lines.join("\n")).toContain("#2 Implement");
+    expect(render(view.widgets, view.theme).slice(1)).toEqual([
+      "  ◻ G1 Design (0/1 completed)",
+      "    ◻ #1 Specify",
+      "  ◻ G2 Build (0/1 completed) › blocked by G1",
+      "    ◻ #2 Implement › blocked by G1, #1",
+      "  ◻ G3 Verify (0/1 completed) › blocked by G1, G2",
+      "    ◻ #3 Check › blocked by G1, G2",
+    ]);
   });
 
   it("shows empty planning groups in topological order", () => {
@@ -62,9 +67,24 @@ describe("grouped task widget", () => {
     widget.update();
 
     const lines = render(view.widgets, view.theme);
-    expect(lines.findIndex(line => line.includes("g1 Upstream")))
-      .toBeLessThan(lines.findIndex(line => line.includes("g2 Empty downstream")));
-    expect(lines.join("\n")).toContain("g2 Empty downstream (empty)");
+    expect(lines.findIndex(line => line.includes("G1 Upstream")))
+      .toBeLessThan(lines.findIndex(line => line.includes("G2 Empty downstream")));
+    expect(lines.join("\n")).toContain("◻ G2 Empty downstream (empty) › blocked by G1");
+  });
+
+  it("styles group IDs bold and dim while styling active names like active tasks", () => {
+    const group = store.createGroup("Build");
+    store.create("Implement", "d", "Implementing", undefined, group.id);
+    store.update("1", { status: "in_progress" });
+    const styledTheme: Theme = {
+      fg: (color, text) => `<${color}>${text}</${color}>`,
+      bold: text => `<bold>${text}</bold>`,
+      strikethrough: text => `<strike>${text}</strike>`,
+    };
+
+    widget.setActiveTask("1");
+    const lines = render(view.widgets, styledTheme);
+    expect(lines[1]).toContain("<accent>✳</accent> <dim><bold>G1</bold></dim> <accent>Build</accent>");
   });
 
   it("uses retained hidden tasks in progress but removes a fully hidden group from the normal widget", () => {

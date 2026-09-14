@@ -168,8 +168,33 @@ export class TaskWidget {
       : visibleTasks;
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w, glyphs.truncation);
+    const groupSummaries = new Map(groups.map(group => [group.id, this.store.getGroupSummary(group.id)]));
+    const displayGroupId = (id: string) => `G${id.replace(/^g/, "")}`;
+    // Blocker suffixes name prerequisites by ID only: the widget has one line per row,
+    // and the group header right above already carries each group's name and progress.
+    const blockingGroupIds = (groupId: string | undefined): string[] => {
+      if (!groupId) return [];
+      const blocked = new Set<string>();
+      const visited = new Set<string>();
+      const visit = (id: string) => {
+        if (visited.has(id)) return;
+        visited.add(id);
+        for (const prerequisiteId of groups.find(item => item.id === id)?.blockedBy ?? []) {
+          if (!groupSummaries.get(prerequisiteId)?.complete) blocked.add(prerequisiteId);
+          visit(prerequisiteId);
+        }
+      };
+      visit(groupId);
+      return [
+        ...groups.filter(group => blocked.has(group.id)).map(group => displayGroupId(group.id)),
+        ...[...blocked].filter(id => !groups.some(group => group.id === id)).map(displayGroupId),
+      ];
+    };
+    const blockerSuffix = (blockers: string[]) => blockers.length > 0
+      ? theme.fg("dim", ` ${glyphs.blocked} blocked by ${blockers.join(", ")}`)
+      : "";
 
-    const emptyGroups = groups.filter(group => (this.store.getGroupSummary(group.id)?.total ?? 0) === 0);
+    const emptyGroups = groups.filter(group => (groupSummaries.get(group.id)?.total ?? 0) === 0);
     if (tasks.length === 0 && emptyGroups.length === 0) return [];
 
     const completed = allTasks.filter(t => t.status === "completed");
@@ -243,23 +268,34 @@ export class TaskWidget {
 
     for (const entry of entries) {
       if (entry.kind === "group") {
-        const summary = this.store.getGroupSummary(entry.group.id);
+        const summary = groupSummaries.get(entry.group.id);
         if (!summary) continue;
-        const blocked = summary.blockers.length > 0 ? ` — blocked: ${summary.blockers.join("; ")}` : "";
-        const counts = entry.empty
-          ? " (empty)"
-          : ` (${summary.completed}/${summary.total} completed, ${summary.hidden} hidden)`;
-        lines.push(truncate(theme.fg("accent", `  ${entry.group.id} ${entry.group.subject}`)
-          + theme.fg("dim", `${counts}${blocked}`)));
+        const active = allTasks.some(task =>
+          task.groupId === entry.group.id && task.status === "in_progress" && this.activeTaskIds.has(task.id));
+        let statusGlyph: string;
+        let subject: string;
+        if (active) {
+          statusGlyph = theme.fg("accent", spinnerFrame);
+          subject = theme.fg("accent", entry.group.subject);
+        } else if (summary.complete) {
+          statusGlyph = theme.fg("success", glyphs.completed);
+          subject = theme.fg("dim", theme.strikethrough(entry.group.subject));
+        } else {
+          statusGlyph = summary.inProgress > 0 ? theme.fg("accent", glyphs.inProgress) : glyphs.pending;
+          subject = entry.group.subject;
+        }
+        const counts = entry.empty ? " (empty)" : ` (${summary.completed}/${summary.total} completed)`;
+        lines.push(truncate(`  ${statusGlyph} ${theme.fg("dim", theme.bold(displayGroupId(entry.group.id)))} ${subject}`
+          + theme.fg("dim", counts) + blockerSuffix(blockingGroupIds(entry.group.id))));
         if (entry.collapsedCount > 0) {
-          lines.push(truncate(`    ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
+          lines.push(truncate(`      ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
         }
         continue;
       }
       if (entry.kind === "ungrouped") {
-        lines.push(truncate(theme.fg("accent", "  Ungrouped")));
+        lines.push(truncate(`  ${glyphs.pending} ${theme.fg("dim", theme.bold("Ungrouped"))}`));
         if (entry.collapsedCount > 0) {
-          lines.push(truncate(`    ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
+          lines.push(truncate(`      ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
         }
         continue;
       }
@@ -277,13 +313,13 @@ export class TaskWidget {
         statusGlyph = glyphs.pending;
       }
 
-      let suffix = "";
-      if (task.status === "pending") {
-        const readiness = this.store.getReadiness(task.id);
-        if (!readiness.ready) {
-          suffix = theme.fg("dim", ` ${glyphs.blocked} blocked by ${readiness.blockers.join("; ")}`);
-        }
-      }
+      const suffix = task.status === "pending"
+        ? blockerSuffix([
+            ...blockingGroupIds(task.groupId),
+            ...task.blockedBy.filter(id => this.store.get(id)?.status !== "completed").map(id => `#${id}`),
+          ])
+        : "";
+      const indent = groups.length > 0 ? "    " : "  ";
 
       let text: string;
       if (isActive) {
@@ -301,16 +337,16 @@ export class TaskWidget {
             ? ` ${theme.fg("dim", `(${elapsed} ${glyphs.statsSeparator} ${tokenParts.join(" ")})`)}`
             : ` ${theme.fg("dim", `(${elapsed})`)}`;
         }
-        text = `  ${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${
+        text = `${indent}${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${
           theme.fg("accent", form + agentLabel + glyphs.trailingEllipsis)
         }${stats}`;
       } else if (task.status === "completed") {
-        text = `  ${statusGlyph} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
+        text = `${indent}${statusGlyph} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
       } else {
         const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
           ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
           : "";
-        text = `  ${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        text = `${indent}${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
       }
 
       lines.push(truncate(text + suffix));
