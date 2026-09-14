@@ -194,7 +194,7 @@ describe("TaskStore (in-memory)", () => {
     expect(t2.blockedBy).toEqual([]);
   });
 
-  it("clears completed tasks", () => {
+  it("hides completed tasks without deleting them", () => {
     store.create("Completed", "Desc");
     store.create("Pending", "Desc");
     store.update("1", { status: "completed" });
@@ -202,8 +202,9 @@ describe("TaskStore (in-memory)", () => {
     const count = store.clearCompleted();
 
     expect(count).toBe(1);
-    expect(store.list()).toHaveLength(1);
-    expect(store.list()[0].id).toBe("2");
+    expect(store.list()).toHaveLength(2);
+    expect(store.listVisible().map(task => task.id)).toEqual(["2"]);
+    expect(store.get("1")?.hidden).toBe(true);
   });
 
   it("returns not found for update on non-existent task", () => {
@@ -227,29 +228,25 @@ describe("TaskStore (in-memory)", () => {
     expect(retrieved.metadata).toEqual({ pr: "123", reviewer: "alice" });
   });
 
-  it("allows circular dependencies with warning", () => {
+  it("rejects circular dependencies atomically", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { addBlocks: ["2"] });
-    const { warnings } = store.update("2", { addBlocks: ["1"] });
 
-    expect(store.get("1")!.blocks).toContain("2");
-    expect(store.get("2")!.blocks).toContain("1");
-    expect(warnings).toContain("cycle: #2 and #1 block each other");
+    expect(() => store.update("2", { addBlocks: ["1"] })).toThrow("Dependency cycle");
+    expect(store.get("2")!.blocks).not.toContain("1");
   });
 
-  it("allows self-dependency with warning", () => {
+  it("rejects self-dependencies", () => {
     store.create("Self", "Desc");
-    const { warnings } = store.update("1", { addBlocks: ["1"] });
-    expect(store.get("1")!.blocks).toContain("1");
-    expect(warnings).toContain("#1 blocks itself");
+    expect(() => store.update("1", { addBlocks: ["1"] })).toThrow("cannot depend on itself");
+    expect(store.get("1")!.blocks).toEqual([]);
   });
 
-  it("stores dangling edge IDs with warning", () => {
+  it("rejects dangling dependency IDs", () => {
     store.create("Real", "Desc");
-    const { warnings } = store.update("1", { addBlocks: ["9999"] });
-    expect(store.get("1")!.blocks).toContain("9999");
-    expect(warnings).toContain("#9999 does not exist");
+    expect(() => store.update("1", { addBlocks: ["9999"] })).toThrow("does not exist");
+    expect(store.get("1")!.blocks).toEqual([]);
   });
 
   it("returns no warnings for valid dependencies", () => {
@@ -285,7 +282,7 @@ describe("TaskStore (in-memory)", () => {
     expect(warnings).toEqual([]);
   });
 
-  it("clearCompleted cleans up dependency edges", () => {
+  it("clearCompleted retains dependency edges", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");
     store.update("1", { addBlocks: ["2"] });
@@ -293,8 +290,8 @@ describe("TaskStore (in-memory)", () => {
 
     store.clearCompleted();
 
-    const t2 = store.get("2")!;
-    expect(t2.blockedBy).toEqual([]);
+    expect(store.get("1")?.hidden).toBe(true);
+    expect(store.get("2")?.blockedBy).toEqual(["1"]);
   });
 
   it("handles multiple addBlocks in one call", () => {
@@ -309,26 +306,21 @@ describe("TaskStore (in-memory)", () => {
     expect(store.get("3")!.blockedBy).toContain("1");
   });
 
-  it("addBlockedBy warns on self-dependency", () => {
+  it("rejects addBlockedBy self-dependencies", () => {
     store.create("Self", "Desc");
-    const { warnings } = store.update("1", { addBlockedBy: ["1"] });
-    expect(store.get("1")!.blockedBy).toContain("1");
-    expect(warnings).toContain("#1 blocks itself");
+    expect(() => store.update("1", { addBlockedBy: ["1"] })).toThrow("cannot depend on itself");
   });
 
-  it("addBlockedBy warns on dangling ref", () => {
+  it("rejects dangling addBlockedBy references", () => {
     store.create("Real", "Desc");
-    const { warnings } = store.update("1", { addBlockedBy: ["9999"] });
-    expect(store.get("1")!.blockedBy).toContain("9999");
-    expect(warnings).toContain("#9999 does not exist");
+    expect(() => store.update("1", { addBlockedBy: ["9999"] })).toThrow("does not exist");
   });
 
-  it("addBlockedBy warns on cycle", () => {
+  it("rejects addBlockedBy cycles", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { addBlocks: ["2"] });
-    const { warnings } = store.update("1", { addBlockedBy: ["2"] });
-    expect(warnings).toContain("cycle: #1 and #2 block each other");
+    expect(() => store.update("1", { addBlockedBy: ["2"] })).toThrow("Dependency cycle");
   });
 
   it("clearCompleted returns 0 when no completed tasks", () => {

@@ -209,8 +209,12 @@ describe("stale in_progress task reminders", () => {
     await mock.fireLifecycle("turn_end", { message: { role: "assistant", usage: { input: 1, output: 1 } } });
 
     // /tasks → Clear all. Not a tool call, so cadence never learns the list is gone.
-    const answers: Array<string | undefined> = ["Clear all (1)", undefined];
-    await mock.runCommand("tasks", { select: async () => answers.shift(), input: async () => undefined });
+    const answers: Array<string | undefined> = ["Delete all (1 tasks, 0 groups)", undefined];
+    await mock.runCommand("tasks", {
+      select: async () => answers.shift(),
+      input: async () => undefined,
+      confirm: async () => true,
+    });
 
     const contextResult = await mock.fireLifecycle("context", { messages: [] });
     const reminder = contextResult.messages.at(-1).content[0].text;

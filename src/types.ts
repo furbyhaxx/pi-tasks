@@ -11,8 +11,19 @@ export interface Task {
   status: TaskStatus;
   activeForm?: string;
   owner?: string;
+  groupId?: string;
+  hidden?: boolean;
   metadata: Record<string, any>;
   blocks: string[];
+  blockedBy: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskGroup {
+  id: string;
+  subject: string;
+  description?: string;
   blockedBy: string[];
   createdAt: number;
   updatedAt: number;
@@ -21,7 +32,14 @@ export interface Task {
 /** Serialized store format on disk. */
 export interface TaskStoreData {
   nextId: number;
+  nextGroupId: number;
   tasks: Task[];
+  groups: TaskGroup[];
+}
+
+export interface TaskReadiness {
+  ready: boolean;
+  blockers: string[];
 }
 
 /** Background process associated with a task. */

@@ -12,11 +12,12 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 ## Features
 
-- **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — matching Claude Code's exact tool specs and descriptions
+- **9 LLM-callable tools** — the seven Claude Code-style task tools plus `TaskGroupCreate` and `TaskGroupUpdate` for ordered work phases
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status marks, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts. Every glyph is [configurable](CUSTOMIZING.md#task-glyphs)
 - **System-reminder injection** — periodic `<system-reminder>` nudges injected into the upcoming LLM request (via the `context` hook, transient and never persisted) when task tools haven't been used recently, or when a task is left stuck `in_progress` after a text-only turn. Shaped after Claude Code's todo reminders — an empty-list nudge or a JSON echo of the current list (capped at 10 tasks)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
-- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references
+- **Task groups and dependency gates** — organize work into one level of named phases; a downstream group's tasks cannot start until every task in each prerequisite group is complete
+- **Retained task history** — automatic cleanup hides completed tasks instead of deleting their descriptions, results, or dependency links
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
@@ -39,11 +40,13 @@ pi -e ./src/index.ts
 The extension renders a persistent widget above the editor:
 
 ```
-● 4 tasks (1 done, 1 in progress, 2 open)
+● 4 tasks in 2 groups (1 done, 1 in progress, 2 open)
+  g1 Design (1/2 completed, 0 hidden)
   ✔ #1 Design the flux capacitor
   ✳ #2 Acquiring plutonium… (2m 49s · ↑ 4.1k ↓ 1.2k)
-  ◻ #3 Install flux capacitor in DeLorean › blocked by #1
-  ◻ #4 Test time travel at 88 mph › blocked by #2, #3
+  g2 Validation (0/2 completed, 0 hidden) — blocked: group g1
+  ◻ #3 Install flux capacitor in DeLorean › blocked by group g1
+  ◻ #4 Test time travel at 88 mph › blocked by group g1
 ```
 
 | Glyph | Meaning |
@@ -89,6 +92,12 @@ See [Writing your own sort order](CUSTOMIZING.md#writing-your-own-sort-order) fo
 
 ## Tools
 
+### `TaskGroupCreate` and `TaskGroupUpdate`
+
+Groups are non-executable containers with stable IDs (`g1`, `g2`, …). `TaskGroupCreate` accepts a subject, optional description, and optional `blockedBy` group IDs. `TaskGroupUpdate` renames/edits a group, adds or removes prerequisite groups, or deletes the container. Deleting a group ungroups its tasks and is rejected while another group depends on it; it never deletes tasks.
+
+Group dependencies are barriers: if `g2` is blocked by `g1`, every task in `g1` must be completed before any pending task in `g2` can start. Empty prerequisite groups remain blocking. Cycles—including cycles formed by combining task and group edges—are rejected.
+
 ### `TaskCreate`
 
 Create a structured task. Used proactively for complex multi-step work.
@@ -98,6 +107,7 @@ Create a structured task. Used proactively for complex multi-step work.
 | `subject` | string | yes | Brief imperative title |
 | `description` | string | yes | Detailed context and acceptance criteria |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., "Running tests") |
+| `groupId` | string | no | Group membership; the group's prerequisites gate this task |
 | `agentType` | string | no | Agent type for subagent execution (e.g., `"general-purpose"`, `"Explore"`) |
 | `metadata` | object | no | Arbitrary key-value pairs |
 
@@ -107,7 +117,7 @@ Create a structured task. Used proactively for complex multi-step work.
 
 ### `TaskList`
 
-List all tasks with status, owner, and blocked-by info.
+List visible tasks with status, owner, group progress, and effective task/group blockers. Pass `includeHidden: true` to inspect retained completed history, or `groupId` to select one group (`null` selects ungrouped tasks).
 
 ```
 #1 [pending] Fix authentication bug
@@ -144,15 +154,17 @@ Update task fields, status, metadata, and dependencies.
 | `description` | string | New description |
 | `activeForm` | string | Spinner text |
 | `owner` | string | Agent name |
+| `groupId` | string / null | Move to a group or ungroup; active/completed tasks must be reset to pending when moved |
+| `hidden` | boolean | Hide or restore completed history |
 | `metadata` | object | Shallow merge (null values delete keys) |
-| `addBlocks` | string[] | Task IDs this task blocks |
-| `addBlockedBy` | string[] | Task IDs that block this task |
+| `addBlocks` / `removeBlocks` | string[] | Add/remove task IDs this task blocks |
+| `addBlockedBy` / `removeBlockedBy` | string[] | Add/remove prerequisite task IDs |
 
 ```
 → Updated task #1 status
 → Updated task #2 owner, status
 → Updated task #3 blocks
-→ Updated task #3 blocks (warning: cycle: #3 and #1 block each other)
+→ Invalid dependency updates are rejected before changing the graph
 → Updated task #1 deleted
 ```
 
@@ -193,26 +205,27 @@ Execute one or more tasks as background subagents. Requires [@tintinweb/pi-subag
 | `model` | string | Model override (e.g., `"sonnet"`, `"haiku"`) |
 | `max_turns` | number | Max turns per agent |
 
-Tasks must be `pending`, have `agentType` set, and all `blockedBy` dependencies `completed`. Each task spawns as an independent background subagent.
+Tasks must be `pending`, have `agentType` set, have all task prerequisites completed, and belong to a group whose transitive prerequisite groups are complete. The readiness check and state claim happen atomically, so shared sessions cannot launch the same task twice.
 
 With **auto-cascade** enabled (via `/tasks` → Settings), completed tasks automatically trigger execution of their unblocked dependents — flowing through the DAG like a build system. Each cascaded agent receives its prerequisites' stored results in the prompt, so it can build directly on what came before without re-fetching.
 
 ## Task Lifecycle
 
 ```
-pending → in_progress → completed
+pending → in_progress → completed → hidden history
                       → deleted (permanently removed)
 ```
 
-Tasks are created as `pending`. Mark `in_progress` before starting work, `completed` when done. `deleted` removes entirely — IDs never reset.
+Tasks are created as `pending`. Starting a task is rejected while any task or group prerequisite is open. Cleanup changes completed tasks to hidden history without changing their status. Reopening a task unhides it. `deleted` remains an explicit permanent removal; IDs never reset.
 
 ## Dependency Management
 
 - **Bidirectional edges:** `addBlocks`/`addBlockedBy` maintain both sides automatically
-- **Dependency warnings:** cycles, self-dependencies, and references to non-existent tasks are stored but produce warnings in the tool response
-- **Display-time filtering:** `TaskList` only shows non-completed blockers in `[blocked by ...]`
-- **Raw data preserved:** `TaskGet` shows ALL edges, including completed blockers
-- **Cleanup on deletion:** removing a task cleans up all edges pointing to it
+- **Validated edges:** new cycles, self-dependencies, and references to non-existent tasks are rejected atomically
+- **Group barriers:** group `blockedBy` edges gate every task in the downstream group until the complete transitive prerequisite chain is done
+- **Central readiness:** tools, `/tasks`, subagent execution, and auto-cascade use the same readiness calculation
+- **Raw data preserved:** hidden tasks and completed edges remain available through `TaskGet`, `TaskOutput`, and `TaskList(includeHidden: true)`
+- **Explicit deletion:** permanently removing a task cleans up edges pointing to it; automatic cleanup does not
 
 ## Task Storage
 
@@ -241,21 +254,21 @@ Picking `session-global` from `/tasks` → Settings saves it as a *project* over
 }
 ```
 
-On new session start, if all persisted tasks are completed they are auto-cleared for a clean slate. On session resume, all tasks (including completed) are shown so the user can review progress. Empty session files are automatically deleted when all tasks are cleared.
+On new session start, an all-completed list is hidden for a clean active view when automatic cleanup is enabled; the records remain in the session file. On resume, visible work is restored and retained history remains available. Session files are deleted only after explicit deletion leaves both tasks and groups empty.
 
-### Auto-clear completed tasks
+### Automatic hiding and retained history
 
-The `autoClearCompleted` setting controls automatic cleanup of completed tasks:
+The existing `autoClearCompleted` setting controls when completed tasks leave the active view. Cleanup never deletes task records:
 
 | Mode | Behaviour |
 |------|-----------|
-| `never` | Completed tasks stay visible until manually cleared via `/tasks` → Clear completed |
-| `on_list_complete` **(default)** | Cleared once all tasks are done and a few idle turns pass |
-| `on_task_complete` | Each completed task cleared individually after a few turns |
+| `never` | Completed tasks remain visible until manually hidden |
+| `on_list_complete` **(default)** | All completed tasks are hidden once the task list is done and a few idle turns pass |
+| `on_task_complete` | Each completed task is hidden individually after a few turns |
 
-Both auto-clear modes use a turn-based delay for non-jarring UX — tasks linger briefly so you see the completion before they disappear.
+Both automatic modes use a turn-based delay for non-jarring UX. Hidden tasks retain their descriptions, results, group membership, and dependency links. Use `/tasks` → Show history or `TaskList(includeHidden: true)` to inspect them, and Restore to return a completed task to the active view.
 
-In either mode, a list with nothing left to do is also retired when a *later* batch of work begins, however long it has been sitting there. The turn delay only runs while the conversation does, so a list completed just before the agent stopped would otherwise still be on screen when the next task arrived, and that task would join it. The finished list stays visible while you read it and through any follow-up question, and goes when the agent starts new work. Tasks the agent adds to a list it is still working through are unaffected, and task IDs stay monotonic and are never reused.
+In either automatic mode, a list with nothing left to do is also hidden when a *later* batch of work begins, however long it has been sitting there. The turn delay only runs while the conversation does, so a list completed just before the agent stopped would otherwise still be on screen when the next task arrived, and that task would join it. The finished list stays visible while you read it and through any follow-up question, and goes when the agent starts new work. Tasks the agent adds to a list it is still working through are unaffected, and task IDs stay monotonic and are never reused.
 
 Settings (`taskScope`, `autoCascade`, `autoClearCompleted`, plus the [widget display settings](#widget-display-settings) `sortOrder` / `collapseCompleted` / `maxVisible` / `showAll` / `hiddenAt`) changed through `/tasks` are saved as project overrides in `<workspace>/.pi/tasks-config.json`. `glyphs` is config-file only — see [CUSTOMIZING.md](CUSTOMIZING.md#task-glyphs).
 
@@ -306,15 +319,19 @@ Interactive menu:
 Tasks
 ├─ View all tasks (4)
 ├─ Create task
-├─ Clear completed (1)
-├─ Clear all (4)
+├─ Create task group
+├─ Manage task groups (2)
+├─ Show history (1)
+├─ Hide completed (1)
+├─ Delete all (5 tasks, 2 groups)
 └─ Settings
 ```
 
-- **View all tasks** — select a task to see details and take actions (start, complete, delete)
-- **Create task** — input prompts for subject and description
-- **Clear completed** — remove all completed tasks
-- **Clear all** — remove all tasks regardless of status
+- **View all tasks** — select visible work to start, complete, hide, move, ungroup, or permanently delete
+- **Create task / task group** — create leaf work or an ordered planning phase
+- **Manage task groups** — rename groups, edit prerequisites, or remove a container without deleting its tasks
+- **Show history / Hide completed** — inspect, restore, or retire completed work without data loss
+- **Delete all** — confirmed permanent deletion of all tasks, results, dependencies, and groups
 - **Settings** — configure project overrides for task storage, auto-cascade, auto-clear completed tasks, and [widget display](#widget-display-settings) (sort order, max visible, show all, hidden position)
 
 ## Cross-extension Communication with [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents)
@@ -385,10 +402,10 @@ If [`pi-subagents`](https://github.com/tintinweb/pi-subagents) is not installed,
 
 ```
 src/
-├── index.ts            # Extension entry: 7 tools + /tasks command + widget + subagent integration
-├── types.ts            # Task, TaskStatus, BackgroundProcess types
-├── task-store.ts       # File-backed store with CRUD, dependencies, locking
-├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)
+├── index.ts            # Extension entry: task/group tools, /tasks, reminders, and subagent integration
+├── types.ts            # Task, TaskGroup, status, readiness, and process types
+├── task-store.ts       # Locked task/group store, graph validation, readiness, and retained history
+├── auto-clear.ts       # Turn-based hiding of completed tasks (AutoClearManager)
 ├── tasks-config.ts     # Global defaults and project override persistence
 ├── task-paths.ts       # Where session task files live, per taskScope
 ├── task-glyphs.ts      # Glyph defaults and config validation

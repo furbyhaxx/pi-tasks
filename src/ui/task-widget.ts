@@ -13,12 +13,12 @@
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { resolveTaskGlyphs } from "../task-glyphs.js";
-import type { TaskStore } from "../task-store.js";
+import { orderTaskGroups, type TaskStore } from "../task-store.js";
 import type { TasksConfig } from "../tasks-config.js";
 
 // ---- Truncation ----
 
-import type { Task } from "../types.js";
+import type { Task, TaskGroup } from "../types.js";
 
 function truncateFromTop(tasks: Task[], limit: number): Task[] {
   return tasks.slice(-limit);
@@ -157,13 +157,22 @@ export class TaskWidget {
     // Resolved per render, not cached: the extension swaps this config object's
     // contents when the host moves to a session in another workspace.
     const glyphs = resolveTaskGlyphs(this.config.glyphs);
-    const tasks = this.store.list(sortOrder);
+    const allTasks = this.store.list(sortOrder);
+    const groups = orderTaskGroups(this.store.listGroups());
+    const visibleTasks = allTasks.filter(task => !task.hidden);
+    const tasks = groups.length > 0
+      ? [
+          ...groups.flatMap(group => visibleTasks.filter(task => task.groupId === group.id)),
+          ...visibleTasks.filter(task => !task.groupId || !this.store.getGroup(task.groupId)),
+        ]
+      : visibleTasks;
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w, glyphs.truncation);
 
-    if (tasks.length === 0) return [];
+    const emptyGroups = groups.filter(group => (this.store.getGroupSummary(group.id)?.total ?? 0) === 0);
+    if (tasks.length === 0 && emptyGroups.length === 0) return [];
 
-    const completed = tasks.filter(t => t.status === "completed");
+    const completed = allTasks.filter(t => t.status === "completed");
     const inProgress = tasks.filter(t => t.status === "in_progress");
     const pending = tasks.filter(t => t.status === "pending");
 
@@ -171,7 +180,8 @@ export class TaskWidget {
     if (completed.length > 0) parts.push(`${completed.length} done`);
     if (inProgress.length > 0) parts.push(`${inProgress.length} in progress`);
     if (pending.length > 0) parts.push(`${pending.length} open`);
-    const statusText = `${tasks.length} tasks (${parts.join(", ")})`;
+    if (allTasks.some(task => task.hidden)) parts.push(`${allTasks.filter(task => task.hidden).length} hidden`);
+    const statusText = `${allTasks.length} tasks${groups.length > 0 ? ` in ${groups.length} groups` : ""}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`;
 
     const spinnerFrame = glyphs.spinner[this.widgetFrame % glyphs.spinner.length];
     const lines: string[] = [truncate(theme.fg("accent", glyphs.header) + " " + theme.fg("accent", statusText))];
@@ -192,11 +202,68 @@ export class TaskWidget {
       ? truncate(theme.fg("dim", `    ${glyphs.overflow} and ${hiddenCount} more`))
       : undefined;
 
-    if (overflowLine && hiddenAt === "top") {
-      lines.push(overflowLine);
+    if (overflowLine && hiddenAt === "top") lines.push(overflowLine);
+    type DisplayEntry =
+      | { kind: "group"; group: TaskGroup; empty: boolean; collapsedCount: number }
+      | { kind: "ungrouped"; collapsedCount: number }
+      | { kind: "task"; task: Task };
+    const entries: DisplayEntry[] = [];
+    let omittedSpecialGroups = 0;
+    let specialGroupCount = 0;
+    if (groups.length > 0) {
+      for (const group of groups) {
+        const groupTasks = tasks.filter(task => task.groupId === group.id);
+        const groupVisible = visible.filter(task => task.groupId === group.id);
+        const collapsedCount = collapseCompleted
+          ? groupTasks.filter(task => task.status === "completed").length
+          : 0;
+        const empty = emptyGroups.includes(group);
+        const specialOnly = groupVisible.length === 0 && (empty || collapsedCount > 0);
+        if (specialOnly && specialGroupCount >= DEFAULT_MAX_VISIBLE_TASKS) {
+          omittedSpecialGroups++;
+          continue;
+        }
+        if (groupVisible.length > 0 || specialOnly) {
+          if (specialOnly) specialGroupCount++;
+          entries.push({ kind: "group", group, empty, collapsedCount });
+          entries.push(...groupVisible.map(task => ({ kind: "task" as const, task })));
+        }
+      }
+      const ungroupedVisible = visible.filter(task => !task.groupId || !this.store.getGroup(task.groupId));
+      const collapsedCount = collapseCompleted
+        ? tasks.filter(task => !task.groupId && task.status === "completed").length
+        : 0;
+      if (ungroupedVisible.length > 0 || collapsedCount > 0) {
+        entries.push({ kind: "ungrouped", collapsedCount });
+        entries.push(...ungroupedVisible.map(task => ({ kind: "task" as const, task })));
+      }
+    } else {
+      entries.push(...visible.map(task => ({ kind: "task" as const, task })));
     }
-    for (let i = 0; i < visible.length; i++) {
-      const task = visible[i];
+
+    for (const entry of entries) {
+      if (entry.kind === "group") {
+        const summary = this.store.getGroupSummary(entry.group.id);
+        if (!summary) continue;
+        const blocked = summary.blockers.length > 0 ? ` — blocked: ${summary.blockers.join("; ")}` : "";
+        const counts = entry.empty
+          ? " (empty)"
+          : ` (${summary.completed}/${summary.total} completed, ${summary.hidden} hidden)`;
+        lines.push(truncate(theme.fg("accent", `  ${entry.group.id} ${entry.group.subject}`)
+          + theme.fg("dim", `${counts}${blocked}`)));
+        if (entry.collapsedCount > 0) {
+          lines.push(truncate(`    ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
+        }
+        continue;
+      }
+      if (entry.kind === "ungrouped") {
+        lines.push(truncate(theme.fg("accent", "  Ungrouped")));
+        if (entry.collapsedCount > 0) {
+          lines.push(truncate(`    ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${entry.collapsedCount} completed`)}`));
+        }
+        continue;
+      }
+      const task = entry.task;
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
 
       let statusGlyph: string;
@@ -211,13 +278,10 @@ export class TaskWidget {
       }
 
       let suffix = "";
-      if (task.status === "pending" && task.blockedBy.length > 0) {
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = this.store.get(bid);
-          return blocker && blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          suffix = theme.fg("dim", ` ${glyphs.blocked} blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
+      if (task.status === "pending") {
+        const readiness = this.store.getReadiness(task.id);
+        if (!readiness.ready) {
+          suffix = theme.fg("dim", ` ${glyphs.blocked} blocked by ${readiness.blockers.join("; ")}`);
         }
       }
 
@@ -252,11 +316,15 @@ export class TaskWidget {
       lines.push(truncate(text + suffix));
     }
 
+    if (omittedSpecialGroups > 0) {
+      lines.push(truncate(theme.fg("dim", `    ${glyphs.overflow} and ${omittedSpecialGroups} more groups`)));
+    }
     if (overflowLine && hiddenAt !== "top") {
       lines.push(overflowLine);
     }
-    if (collapseCompleted && completed.length > 0) {
-      lines.push(truncate(`  ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${completed.length} completed`)}`));
+    if (groups.length === 0 && collapseCompleted && completed.some(task => !task.hidden)) {
+      const visibleCompleted = completed.filter(task => !task.hidden);
+      lines.push(truncate(`  ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${visibleCompleted.length} completed`)}`));
     }
 
     return lines;
@@ -265,10 +333,12 @@ export class TaskWidget {
   /** Force an immediate widget update. */
   update() {
     if (!this.uiCtx) return;
-    const tasks = this.store.list();
+    const allTasks = this.store.list();
+    const tasks = allTasks.filter(task => !task.hidden);
+    const hasEmptyGroup = this.store.listGroups().some(group => (this.store.getGroupSummary(group.id)?.total ?? 0) === 0);
 
     // Transition: visible → hidden
-    if (tasks.length === 0) {
+    if (tasks.length === 0 && !hasEmptyGroup) {
       if (this.widgetRegistered) {
         this.uiCtx.setWidget("tasks", undefined);
         this.widgetRegistered = false;
@@ -290,7 +360,7 @@ export class TaskWidget {
     }
 
     // Check if any task needs animation
-    const hasActiveSpinner = tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
+    const hasActiveSpinner = allTasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
     if (hasActiveSpinner) {
       this.ensureTimer();
     } else if (!hasActiveSpinner && this.widgetInterval) {

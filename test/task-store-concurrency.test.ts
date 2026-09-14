@@ -163,6 +163,18 @@ describe("TaskStore — shared file access", () => {
     expect(existsSync(`${file}.lock`)).toBe(false);
   });
 
+  it("does not resurrect stale tasks after another session removes an empty store file", () => {
+    const a = new TaskStore(file);
+    a.create("Old", "d");
+    const b = new TaskStore(file);
+
+    a.clearAll();
+    expect(a.deleteFileIfEmpty()).toBe(true);
+    b.create("New", "d");
+
+    expect(new TaskStore(file).list().map(task => task.subject)).toEqual(["New"]);
+  });
+
   it("leaves no lock or temp file behind after a mutation", () => {
     const store = new TaskStore(file);
     store.create("Task", "d");

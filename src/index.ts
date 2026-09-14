@@ -2,8 +2,9 @@
  * @tintinweb/pi-tasks — A pi extension providing Claude Code-style task tracking and coordination.
  *
  * Tools:
+ *   TaskGroupCreate / TaskGroupUpdate — Manage dependency-gated task groups
  *   TaskCreate   — Create a structured task
- *   TaskList     — List all tasks with status
+ *   TaskList     — List visible tasks with status
  *   TaskGet      — Get full task details
  *   TaskUpdate   — Update task fields, status, dependencies
  *   TaskOutput   — Get output from a background task process
@@ -30,7 +31,7 @@ import {
 } from "./reminder-cadence.js";
 import { resolveTaskGlyphs } from "./task-glyphs.js";
 import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
-import { TaskStore } from "./task-store.js";
+import { orderTaskGroups, TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
 import type { Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
@@ -50,7 +51,17 @@ function textResult(msg: string) {
 }
 
 /** Task tool names — used to detect task tool usage for reminder suppression. */
-const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskOutput", "TaskStop", "TaskExecute"]);
+const TASK_TOOL_NAMES = new Set([
+  "TaskGroupCreate",
+  "TaskGroupUpdate",
+  "TaskCreate",
+  "TaskList",
+  "TaskGet",
+  "TaskUpdate",
+  "TaskOutput",
+  "TaskStop",
+  "TaskExecute",
+]);
 
 /** How many turns without task tool usage before injecting a reminder. */
 const REMINDER_INTERVAL = 4;
@@ -66,7 +77,7 @@ function intervalFor(tasks: Task[]): number {
   return tasks.some(t => t.status === "in_progress") ? ACTIVE_REMINDER_INTERVAL : REMINDER_INTERVAL;
 }
 
-/** How many turns completed tasks linger before auto-clearing. */
+/** How many turns completed tasks linger before being hidden. */
 const AUTO_CLEAR_DELAY = 4;
 
 /** Neutralize a task field for the echo: collapse newlines and strip reminder tags. */
@@ -108,6 +119,7 @@ function buildSystemReminder(tasks: Task[]): string {
       status: t.status,
     };
     if (t.activeForm) item.activeForm = sanitizeField(t.activeForm);
+    if (t.groupId) item.groupId = t.groupId;
     return item;
   });
 
@@ -292,10 +304,59 @@ export default function (pi: ExtensionAPI) {
 
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
 
-  // ── Subagent completion listener ──
-  // Listens for subagent lifecycle events to update task status and optionally cascade.
+  /** Agent-backed pending tasks that are ready at this instant. Capturing this
+   *  before a completion lets cascade launch only work that completion released. */
+  function readyAgentTaskIds(): Set<string> {
+    return new Set(store.list()
+      .filter(task => task.status === "pending" && task.metadata?.agentType && store.getReadiness(task.id).ready)
+      .map(task => task.id));
+  }
 
-  // Success → mark task completed, cascade if enabled
+  async function launchClaimedTask(task: Task, options: {
+    additionalContext?: string;
+    model?: string;
+    maxTurns?: number;
+  }): Promise<string> {
+    const prompt = buildTaskPrompt(task, options.additionalContext);
+    try {
+      const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
+        description: task.subject,
+        isBackground: true,
+        maxTurns: options.maxTurns,
+        ...(options.model ? { model: options.model } : {}),
+      });
+      agentTaskMap.set(agentId, task.id);
+      store.update(task.id, { owner: agentId, metadata: { ...task.metadata, agentId, lastError: null } });
+      widget.setActiveTask(task.id);
+      return agentId;
+    } catch (error: any) {
+      store.update(task.id, {
+        status: "pending",
+        metadata: { ...task.metadata, result: null, lastError: error.message },
+      });
+      throw error;
+    }
+  }
+
+  async function cascadeNewlyReady(previouslyReady: Set<string>): Promise<void> {
+    if (!(cfg.autoCascade ?? false) || !cascadeConfig || !latestCtx) return;
+    const released = store.list().filter(task =>
+      task.status === "pending"
+      && task.metadata?.agentType
+      && !previouslyReady.has(task.id)
+      && store.getReadiness(task.id).ready
+    );
+    for (const task of released) {
+      const claimed = store.claim(task.id);
+      if (!claimed.task || claimed.blockers.length > 0) continue;
+      try {
+        await launchClaimedTask(claimed.task, cascadeConfig);
+      } catch { /* launchClaimedTask records the error and rolls back to pending */ }
+    }
+  }
+
+  // ── Subagent completion listener ──
+
   pi.events.on("subagents:completed", async (data) => {
     const { id, result } = data as { id: string; result?: string };
     const taskId = agentTaskMap.get(id);
@@ -304,42 +365,17 @@ export default function (pi: ExtensionAPI) {
     const task = store.get(taskId);
     if (!task) return;
 
+    const previouslyReady = readyAgentTaskIds();
     store.update(task.id, { status: "completed", metadata: { ...task.metadata, result } });
     widget.setActiveTask(task.id, false);
-
-    // Auto-cascade: find unblocked dependents with agentType
-    if ((cfg.autoCascade ?? false) && cascadeConfig && latestCtx) {
-      const unblocked = store.list().filter(t =>
-        t.status === "pending" &&
-        t.metadata?.agentType &&
-        t.blockedBy.includes(task.id) &&
-        t.blockedBy.every(depId => store.get(depId)?.status === "completed")
-      );
-      for (const next of unblocked) {
-        store.update(next.id, { status: "in_progress" });
-        const prompt = buildTaskPrompt(next, cascadeConfig.additionalContext);
-        try {
-          const agentId = await spawnSubagent(next.metadata.agentType, prompt, {
-            description: next.subject,
-            isBackground: true,
-            maxTurns: cascadeConfig.maxTurns,
-            ...(cascadeConfig.model ? { model: cascadeConfig.model } : {}),
-          });
-          agentTaskMap.set(agentId, next.id);
-          store.update(next.id, { owner: agentId, metadata: { ...next.metadata, agentId } });
-          widget.setActiveTask(next.id);
-        } catch (err: any) {
-          store.update(next.id, { status: "pending", metadata: { ...next.metadata, result: null, lastError: err.message } });
-        }
-      }
-    }
+    await cascadeNewlyReady(previouslyReady);
     autoClear.trackCompletion(task.id, cadence.currentTurn);
     widget.update();
   });
 
   // Failure → store error, revert to pending, don't cascade (branch stops)
   // Intentional stop (status === "stopped") → mark completed, preserve partial result
-  pi.events.on("subagents:failed", (data) => {
+  pi.events.on("subagents:failed", async (data) => {
     const { id, error, result, status } = data as { id: string; error?: string; result?: string; status: string };
     const taskId = agentTaskMap.get(id);
     if (!taskId) return;
@@ -348,8 +384,10 @@ export default function (pi: ExtensionAPI) {
     if (!task) return;
 
     if (status === "stopped") {
+      const previouslyReady = readyAgentTaskIds();
       // Intentional stop — mark completed, preserve partial result
       store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: result || task.metadata?.result } });
+      await cascadeNewlyReady(previouslyReady);
       autoClear.trackCompletion(task.id, cadence.currentTurn);
     } else {
       // Actual error — revert to pending. `result: null` drops it (the store deletes
@@ -429,22 +467,17 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** Restore widget on session start/resume if there's unfinished work.
-   *  On new sessions, auto-clear if all tasks are completed (clean slate).
-   *  On resume, always show tasks (user may want to review).
-   *  Only runs once — the first caller wins. */
+  /** Restore the widget after startup/session changes. Automatic cleanup hides
+   *  completed history instead of deleting it and respects `never`. */
   function showPersistedTasks(isResume = false) {
     if (persistedTasksShown) return;
     persistedTasksShown = true;
     const tasks = store.list();
-    if (tasks.length > 0) {
-      if (!isResume && tasks.every(t => t.status === "completed")) {
-        store.clearCompleted();
-        if (isSessionScope()) deleteSessionFileIfEmpty();
-      } else {
-        widget.update();
-      }
+    if (!isResume && (cfg.autoClearCompleted ?? "on_list_complete") !== "never"
+      && tasks.length > 0 && tasks.every(task => task.status === "completed")) {
+      store.hideCompleted();
     }
+    widget.update();
   }
 
   // ── Turn tracking for system-reminder injection ──
@@ -469,7 +502,7 @@ export default function (pi: ExtensionAPI) {
 
   // The end of a run is the only signal that separates a new batch of tasks from the
   // same batch still being built — the store looks identical either way. Nothing is
-  // cleared here; this only marks the boundary for the next TaskCreate.
+  // hidden here; this only marks the boundary for the next TaskCreate.
   pi.on("agent_settled", async () => {
     autoClear.onRunEnded();
   });
@@ -519,7 +552,7 @@ export default function (pi: ExtensionAPI) {
     // ACTIVE_REMINDER_INTERVAL is the smallest interval any reminder can need.
     if (cadence.currentTurn - cadence.lastTaskToolUseTurn < ACTIVE_REMINDER_INTERVAL) return {};
 
-    const tasks = store.list();
+    const tasks = store.listVisible();
     // Shorter interval while in_progress; passed per-call so the shared config
     // is never mutated.
     evaluateToolResult(cadence, event.toolName, tasks.length > 0, {
@@ -536,7 +569,7 @@ export default function (pi: ExtensionAPI) {
   // returns a transformed messages array used only for this one request.
   pi.on("context", async (event) => {
     if (!drainReminderForContext(cadence)) return {};
-    const tasks = store.list();
+    const tasks = store.listVisible();
 
     return {
       messages: [
@@ -580,9 +613,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     initializeStoreForContext(ctx, true);
-    if (forkSeed?.tasks.length) store.seed(forkSeed); // carry the parent's tasks into the fork
+    if (forkSeed && (forkSeed.tasks.length > 0 || forkSeed.groups.length > 0)) store.seed(forkSeed);
     reattachAgents(); // subagents outlive a reload; relink them before events arrive
-    // resume/reload/fork keep tasks; startup/new auto-clear an all-completed list.
+    // Resume/reload/fork preserve visibility; startup/new may hide an all-completed list.
     const keepsTasks = reason === "reload" || reason === "resume" || reason === "fork";
     showPersistedTasks(keepsTasks);
     // Those tasks are shown for review, but the run that produced them ended with the
@@ -618,7 +651,67 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 1: TaskCreate
+  // Task group tools
+  // ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "TaskGroupCreate",
+    label: "TaskGroupCreate",
+    description: `Create a non-executable task group. Groups organize tasks and may depend on other groups. If group B is blocked by group A, no task in B can start until every task in A is completed. Empty prerequisite groups remain blocking.`,
+    promptGuidelines: [
+      "Use TaskGroupCreate when a plan needs ordered phases; use task dependencies for partial hand-offs between individual tasks.",
+    ],
+    parameters: Type.Object({
+      subject: Type.String({ description: "Group title" }),
+      description: Type.Optional(Type.String({ description: "Planning context for the group" })),
+      blockedBy: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite task-group IDs" })),
+    }),
+    execute(_toolCallId, params) {
+      const group = store.createGroup(params.subject, params.description, params.blockedBy);
+      widget.update();
+      return Promise.resolve(textResult(`Task group ${group.id} created successfully: ${group.subject}`));
+    },
+  });
+
+  pi.registerTool({
+    name: "TaskGroupUpdate",
+    label: "TaskGroupUpdate",
+    description: `Update or delete a task group. Group dependency changes are validated for cycles. Deleting a group ungroups its tasks and is rejected while another group depends on it; it never deletes tasks.`,
+    parameters: Type.Object({
+      groupId: Type.String({ description: "Task-group ID" }),
+      action: Type.Unsafe<"update" | "delete">({ type: "string", enum: ["update", "delete"] }),
+      subject: Type.Optional(Type.String({ description: "New group title (update only)" })),
+      description: Type.Optional(Type.Union([
+        Type.String(),
+        Type.Null(),
+      ], { description: "New description; null clears it (update only)" })),
+      addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite group IDs to add" })),
+      removeBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite group IDs to remove" })),
+    }),
+    execute(_toolCallId, params) {
+      if (params.action === "delete") {
+        if (params.subject !== undefined || params.description !== undefined
+          || params.addBlockedBy !== undefined || params.removeBlockedBy !== undefined) {
+          throw new Error("Delete cannot be combined with group update fields");
+        }
+        if (!store.deleteGroup(params.groupId)) return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+        widget.update();
+        return Promise.resolve(textResult(`Deleted task group ${params.groupId}; its tasks are now ungrouped`));
+      }
+      const group = store.updateGroup(params.groupId, {
+        subject: params.subject,
+        description: params.description,
+        addBlockedBy: params.addBlockedBy,
+        removeBlockedBy: params.removeBlockedBy,
+      });
+      if (!group) return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+      widget.update();
+      return Promise.resolve(textResult(`Updated task group ${group.id}: ${group.subject}`));
+    },
+  });
+
+  // ──────────────────────────────────────────────────
+  // TaskCreate
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -655,6 +748,7 @@ NOTE that you should not use this tool if there is only one trivial task to do. 
 - **subject**: A brief, actionable title in imperative form (e.g., "Fix authentication bug in login flow")
 - **description**: Detailed description of what needs to be done, including context and acceptance criteria
 - **activeForm** (optional): Present continuous form shown in the spinner when the task is in_progress (e.g., "Fixing authentication bug"). If omitted, the spinner shows the subject instead.
+- **groupId** (optional): Place the task in a task group. Its group prerequisites then gate this task.
 
 All tasks are created with status \`pending\`.
 
@@ -675,6 +769,7 @@ All tasks are created with status \`pending\`.
       subject: Type.String({ description: "A brief title for the task" }),
       description: Type.String({ description: "A detailed description of what needs to be done" }),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress (e.g., 'Running tests')" })),
+      groupId: Type.Optional(Type.String({ description: "Task-group ID. Group prerequisites gate task starts." })),
       agentType: Type.Optional(Type.String({ description: "Agent type for subagent execution (e.g., 'general-purpose', 'Explore'). Tasks with agentType can be started via TaskExecute." })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
     }),
@@ -686,7 +781,13 @@ All tasks are created with status \`pending\`.
       autoClear.startNewBatch();
       const meta = params.metadata ?? {};
       if (params.agentType) meta.agentType = params.agentType;
-      const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined);
+      const task = store.create(
+        params.subject,
+        params.description,
+        params.activeForm,
+        Object.keys(meta).length > 0 ? meta : undefined,
+        params.groupId,
+      );
       widget.update();
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
     },
@@ -699,7 +800,7 @@ All tasks are created with status \`pending\`.
   pi.registerTool({
     name: "TaskList",
     label: "TaskList",
-    description: `Use this tool to list all tasks in the task list.
+    description: `Use this tool to list visible tasks and task groups. Pass includeHidden=true to inspect retained completed history.
 
 ## When to Use This Tool
 
@@ -716,44 +817,81 @@ Returns a summary of each task:
 - **subject**: Brief description of the task
 - **status**: 'pending', 'in_progress', or 'completed'
 - **owner**: Agent ID if assigned, empty if available
-- **blockedBy**: List of open task IDs that must be resolved first (tasks with blockedBy cannot be claimed until dependencies resolve)
+- **blockedBy**: Effective open task and task-group prerequisites (blocked tasks cannot be claimed)
 
 Use TaskGet with a specific task ID to view full details including description and comments.`,
-    parameters: Type.Object({}),
+    parameters: Type.Object({
+      groupId: Type.Optional(Type.Union([
+        Type.String(),
+        Type.Null(),
+      ], { description: "Filter by group ID; null selects ungrouped tasks" })),
+      includeHidden: Type.Optional(Type.Boolean({ description: "Include completed task history hidden by cleanup" })),
+    }),
 
-    execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const tasks = store.list();
-      if (tasks.length === 0) return Promise.resolve(textResult("No tasks found"));
+    execute(_toolCallId, params) {
+      const allTasks = store.list();
+      const groups = orderTaskGroups(store.listGroups());
+      if (params.groupId !== undefined && params.groupId !== null && !store.getGroup(params.groupId)) {
+        return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+      }
+      const scopedTasks = params.groupId === undefined
+        ? allTasks
+        : allTasks.filter(task => task.groupId === (params.groupId ?? undefined));
+      const hiddenCount = scopedTasks.filter(task => task.hidden).length;
+      const tasks = params.includeHidden ? scopedTasks : scopedTasks.filter(task => !task.hidden);
 
-      // Sort: pending first (by ID), then in_progress (by ID), then completed (by ID)
       const statusOrder: Record<string, number> = { pending: 0, in_progress: 1, completed: 2 };
-      const sorted = [...tasks].sort((a, b) => {
-        const so = (statusOrder[a.status] ?? 0) - (statusOrder[b.status] ?? 0);
-        if (so !== 0) return so;
-        return Number(a.id) - Number(b.id);
+      const sorted = (items: Task[]) => [...items].sort((a, b) => {
+        const status = (statusOrder[a.status] ?? 0) - (statusOrder[b.status] ?? 0);
+        return status !== 0 ? status : Number(a.id) - Number(b.id);
       });
-
-      const lines = sorted.map(task => {
+      const taskLine = (task: Task) => {
         let line = `#${task.id} [${task.status}] ${task.subject}`;
-
-        if (task.owner) {
-          line += ` (${task.owner})`;
-        }
-
-        // Only show non-completed blockers
-        if (task.blockedBy.length > 0) {
-          const openBlockers = task.blockedBy.filter(bid => {
-            const blocker = store.get(bid);
-            return blocker && blocker.status !== "completed";
-          });
-          if (openBlockers.length > 0) {
-            line += ` [blocked by ${openBlockers.map(id => "#" + id).join(", ")}]`;
-          }
-        }
-
+        if (task.hidden) line += " [hidden]";
+        if (task.owner) line += ` (${task.owner})`;
+        const readiness = store.getReadiness(task.id);
+        if (task.status === "pending" && !readiness.ready) line += ` [blocked by ${readiness.blockers.join("; ")}]`;
         return line;
-      });
+      };
 
+      const lines: string[] = [];
+      if (params.groupId !== undefined) {
+        if (params.groupId !== null) {
+          const group = store.getGroup(params.groupId);
+          const summary = store.getGroupSummary(params.groupId);
+          if (group && summary) {
+            lines.push(`${group.id}: ${group.subject} (${summary.completed}/${summary.total} completed, ${summary.hidden} hidden)`);
+            if (group.description) lines.push(`  ${group.description}`);
+            if (group.blockedBy.length) lines.push(`  Blocked by groups: ${group.blockedBy.join(", ")}`);
+            const blocks = store.getGroupBlocks(group.id);
+            if (blocks.length) lines.push(`  Blocks groups: ${blocks.join(", ")}`);
+          }
+        } else {
+          lines.push("Ungrouped");
+        }
+        lines.push(...sorted(tasks).map(task => `  ${taskLine(task)}`));
+      } else if (groups.length > 0) {
+        for (const group of groups) {
+          const children = sorted(tasks.filter(task => task.groupId === group.id));
+          const summary = store.getGroupSummary(group.id);
+          if (children.length === 0 && summary && summary.total > 0 && !params.includeHidden) continue;
+          const blockerText = summary?.blockers.length ? ` [blocked: ${summary.blockers.join("; ")}]` : "";
+          lines.push(`${group.id}: ${group.subject} (${summary?.completed ?? 0}/${summary?.total ?? 0} completed, ${summary?.hidden ?? 0} hidden)${blockerText}`);
+          lines.push(...children.map(task => `  ${taskLine(task)}`));
+        }
+        const ungrouped = sorted(tasks.filter(task => !task.groupId || !store.getGroup(task.groupId)));
+        if (ungrouped.length > 0) {
+          lines.push("Ungrouped");
+          lines.push(...ungrouped.map(task => `  ${taskLine(task)}`));
+        }
+      } else {
+        lines.push(...sorted(tasks).map(taskLine));
+      }
+
+      if (lines.length === 0) lines.push("No tasks found");
+      if (!params.includeHidden && hiddenCount > 0) {
+        lines.push(`${hiddenCount} hidden completed task${hiddenCount === 1 ? "" : "s"} — use includeHidden: true to view history`);
+      }
       return Promise.resolve(textResult(lines.join("\n")));
     },
   });
@@ -784,7 +922,7 @@ Returns full task details:
 
 ## Tips
 
-- After fetching a task, verify its blockedBy list is empty before beginning work.
+- After fetching a task, verify its effective task and group blockers are empty before beginning work.
 - Use TaskList to see all tasks in summary form.`,
     parameters: Type.Object({
       taskId: Type.String({ description: "The ID of the task to retrieve" }),
@@ -801,19 +939,17 @@ Returns full task details:
         `Task #${task.id}: ${task.subject}`,
         `Status: ${task.status}`,
       ];
-      if (task.owner) {
-        lines.push(`Owner: ${task.owner}`);
+      if (task.hidden) lines.push("Visibility: hidden history");
+      if (task.owner) lines.push(`Owner: ${task.owner}`);
+      if (task.groupId) {
+        const group = store.getGroup(task.groupId);
+        lines.push(`Group: ${task.groupId}${group ? ` — ${group.subject}` : " (missing)"}`);
       }
       lines.push(`Description: ${desc}`);
 
-      if (task.blockedBy.length > 0) {
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = store.get(bid);
-          return blocker && blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          lines.push(`Blocked by: ${openBlockers.map(id => "#" + id).join(", ")}`);
-        }
+      const readiness = store.getReadiness(task.id);
+      if (task.status === "pending" && !readiness.ready) {
+        lines.push(`Blocked by: ${readiness.blockers.join("; ")}`);
       }
       if (task.blocks.length > 0) {
         lines.push(`Blocks: ${task.blocks.map(id => "#" + id).join(", ")}`);
@@ -874,9 +1010,11 @@ Returns full task details:
 - **description**: Change the task description
 - **activeForm**: Present continuous form shown in spinner when in_progress (e.g., "Running tests")
 - **owner**: Change the task owner (agent name)
+- **groupId**: Move to a task group; null ungroups. Running/completed tasks must be reset to pending when moved
+- **hidden**: Hide or restore completed history; non-completed tasks cannot be hidden
 - **metadata**: Merge metadata keys into the task (set a key to null to delete it)
-- **addBlocks**: Mark tasks that cannot start until this one completes
-- **addBlockedBy**: Mark tasks that must complete before this one can start
+- **addBlocks** / **removeBlocks**: Add or remove tasks waiting on this one
+- **addBlockedBy** / **removeBlockedBy**: Add or remove prerequisites
 
 ## Status Workflow
 
@@ -925,13 +1063,22 @@ Set up task dependencies:
       description: Type.Optional(Type.String({ description: "New description for the task" })),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress" })),
       owner: Type.Optional(Type.String({ description: "New owner for the task" })),
+      groupId: Type.Optional(Type.Union([
+        Type.String(),
+        Type.Null(),
+      ], { description: "Task-group ID, or null to ungroup" })),
+      hidden: Type.Optional(Type.Boolean({ description: "Hide or restore a completed task" })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Metadata keys to merge into the task. Set a key to null to delete it." })),
       addBlocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that this task blocks" })),
       addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that block this task" })),
+      removeBlocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs this task should no longer block" })),
+      removeBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite task IDs to remove" })),
     }),
 
-    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { taskId, ...fields } = params;
+      const before = store.get(taskId);
+      const previouslyReady = fields.status === "completed" ? readyAgentTaskIds() : new Set<string>();
       const { task, changedFields, warnings } = store.update(taskId, fields);
 
       if (changedFields.length === 0 && !task) {
@@ -946,8 +1093,12 @@ Set up task dependencies:
         autoClear.resetBatchCountdown();
       } else if (fields.status === "completed" || fields.status === "deleted") {
         widget.setActiveTask(taskId, false);
-        if (fields.status === "completed") autoClear.trackCompletion(taskId, cadence.currentTurn);
+        if (fields.status === "completed") {
+          await cascadeNewlyReady(previouslyReady);
+          autoClear.trackCompletion(taskId, cadence.currentTurn);
+        }
       }
+      if (fields.hidden === false && before?.hidden) autoClear.clearTaskCountdown(taskId);
 
       widget.update();
       let msg = `Updated task #${taskId} ${changedFields.join(", ")}`;
@@ -1085,7 +1236,9 @@ Set up task dependencies:
         }
         const task = store.get(resolvedId);
         if (task?.metadata?.agentId && task.status === "in_progress") {
+          const previouslyReady = readyAgentTaskIds();
           store.update(resolvedId, { status: "completed" });
+          await cascadeNewlyReady(previouslyReady);
           autoClear.trackCompletion(resolvedId, cadence.currentTurn);
           await stopSubagent(task.metadata.agentId);
           widget.setActiveTask(resolvedId, false);
@@ -1095,7 +1248,9 @@ Set up task dependencies:
         throw new Error(`No running background process for task ${taskId}`);
       }
 
+      const previouslyReady = readyAgentTaskIds();
       store.update(taskId, { status: "completed" });
+      await cascadeNewlyReady(previouslyReady);
       autoClear.trackCompletion(taskId, cadence.currentTurn);
       widget.setActiveTask(taskId, false);
       widget.update();
@@ -1115,7 +1270,7 @@ Set up task dependencies:
 ## When to Use This Tool
 
 - To start execution of tasks that have \`agentType\` set (created via TaskCreate with agentType parameter)
-- Tasks must be \`pending\` with all blockedBy dependencies \`completed\`
+- Tasks must be \`pending\`, with all task prerequisites and transitive prerequisite groups completed
 - Each task runs as an independent background subagent
 
 ## Parameters
@@ -1161,33 +1316,21 @@ Set up task dependencies:
           continue;
         }
 
-        // Check all blockers are completed
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = store.get(bid);
-          return !blocker || blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          results.push(`#${taskId}: blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
+        const claimed = store.claim(taskId);
+        if (!claimed.task || claimed.blockers.length > 0) {
+          results.push(`#${taskId}: blocked by ${claimed.blockers.join("; ")}`);
           continue;
         }
 
-        // Mark in_progress and spawn agent via RPC
-        store.update(taskId, { status: "in_progress" });
-        const prompt = buildTaskPrompt(task, params.additional_context);
         try {
-          const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
-            description: task.subject,
-            isBackground: true,
+          const agentId = await launchClaimedTask(claimed.task, {
+            additionalContext: params.additional_context,
+            model: params.model,
             maxTurns: params.max_turns,
-            ...(params.model ? { model: params.model } : {}),
           });
-          agentTaskMap.set(agentId, taskId);
-          store.update(taskId, { owner: agentId, metadata: { ...task.metadata, agentId } });
-          widget.setActiveTask(taskId);
           launched.push(`#${taskId} → agent ${agentId}`);
         } catch (err: any) {
           debug(`spawn:error task=#${taskId}`, err);
-          store.update(taskId, { status: "pending" });
           results.push(`#${taskId}: spawn failed — ${err.message}`);
         }
       }
@@ -1220,131 +1363,212 @@ Set up task dependencies:
   // ──────────────────────────────────────────────────
 
   pi.registerCommand("tasks", {
-    description: "Manage tasks — view, create, clear completed",
+    description: "Manage tasks, groups, dependencies, and retained history",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       latestCtx = ctx;
       widget.setUICtx(ctx.ui as UICtx);
       initializeStoreForContext(ctx);
       const ui = ctx.ui;
+      let viewingHistory = false;
+
+      const statusGlyph = (status: string) => {
+        const glyphs = resolveTaskGlyphs(cfg.glyphs);
+        if (status === "completed") return glyphs.completed;
+        if (status === "in_progress") return glyphs.inProgress;
+        return glyphs.pending;
+      };
 
       const mainMenu = async (): Promise<void> => {
         const tasks = store.list();
-        const taskCount = tasks.length;
-        const completedCount = tasks.filter(t => t.status === "completed").length;
-
-        const choices: string[] = [
-          `View all tasks (${taskCount})`,
+        const visible = tasks.filter(task => !task.hidden);
+        const hiddenCount = tasks.length - visible.length;
+        const completedVisible = visible.filter(task => task.status === "completed").length;
+        const groups = store.listGroups();
+        const choices = [
+          `View all tasks (${visible.length})`,
           "Create task",
+          "Create task group",
         ];
-        if (completedCount > 0) choices.push(`Clear completed (${completedCount})`);
-        if (taskCount > 0) choices.push(`Clear all (${taskCount})`);
+        if (groups.length > 0) choices.push(`Manage task groups (${groups.length})`);
+        if (hiddenCount > 0) choices.push(`Show history (${hiddenCount})`);
+        if (completedVisible > 0) choices.push(`Hide completed (${completedVisible})`);
+        if (tasks.length > 0 || groups.length > 0) choices.push(`Delete all (${tasks.length} tasks, ${groups.length} groups)`);
         choices.push("Settings");
 
         const choice = await ui.select("Tasks", choices);
         if (!choice) return;
-
-        if (choice.startsWith("View")) {
-          await viewTasks();
-        } else if (choice === "Create task") {
-          await createTask();
-        } else if (choice === "Settings") {
-          await settingsMenu();
-        } else if (choice.startsWith("Clear completed")) {
-          store.clearCompleted();
-          if (isSessionScope()) deleteSessionFileIfEmpty();
+        if (choice.startsWith("View")) return viewTasks(false);
+        if (choice === "Create task") return createTask();
+        if (choice === "Create task group") return createGroup();
+        if (choice.startsWith("Manage task groups")) return manageGroups();
+        if (choice.startsWith("Show history")) return viewTasks(true);
+        if (choice === "Settings") return settingsMenu();
+        if (choice.startsWith("Hide completed")) {
+          store.hideCompleted();
           widget.update();
-          await mainMenu();
-        } else if (choice.startsWith("Clear all")) {
-          store.clearAll();
-          if (isSessionScope()) deleteSessionFileIfEmpty();
-          widget.update();
-          await mainMenu();
+          return mainMenu();
+        }
+        if (choice.startsWith("Delete all")) {
+          if (await ui.confirm("Delete all task data?", "This permanently deletes every task, result, dependency, and group.")) {
+            store.clearAll();
+            if (isSessionScope()) deleteSessionFileIfEmpty();
+            widget.update();
+          }
+          return mainMenu();
         }
       };
 
-      const viewTasks = async (): Promise<void> => {
-        const tasks = store.list();
+      const viewTasks = async (includeHidden = viewingHistory): Promise<void> => {
+        viewingHistory = includeHidden;
+        const tasks = store.list().filter(task => includeHidden || !task.hidden);
         if (tasks.length === 0) {
-          await ui.select("No tasks", ["← Back"]);
+          await ui.select(includeHidden ? "No task history" : "No tasks", ["← Back"]);
           return mainMenu();
         }
-
-        const glyphs = resolveTaskGlyphs(cfg.glyphs);
-        const statusGlyph = (status: string) => {
-          switch (status) {
-            case "completed": return glyphs.completed;
-            case "in_progress": return glyphs.inProgress;
-            default: return glyphs.pending;
-          }
-        };
-
-        const choices = tasks.map(t =>
-          `${statusGlyph(t.status)} #${t.id} [${t.status}] ${t.subject}`
-        );
+        const choices = tasks.map(task => {
+          const group = task.groupId ? ` ${task.groupId}` : "";
+          const hidden = task.hidden ? " [hidden]" : "";
+          return `${statusGlyph(task.status)} #${task.id}${group} [${task.status}] ${task.subject}${hidden}`;
+        });
         choices.push("← Back");
-
-        const selected = await ui.select("Tasks", choices);
+        const selected = await ui.select(includeHidden ? "Task history" : "Tasks", choices);
         if (!selected || selected === "← Back") return mainMenu();
-
-        // Matched by row position rather than parsed out of the label: both the glyph
-        // and the subject are free text, and either can contain something like "#42".
         const picked = tasks[choices.indexOf(selected)];
-        if (picked) await viewTaskDetail(picked.id);
-        else return viewTasks();
+        return picked ? viewTaskDetail(picked.id) : viewTasks(includeHidden);
       };
 
       const viewTaskDetail = async (taskId: string): Promise<void> => {
         const task = store.get(taskId);
         if (!task) return viewTasks();
-
         const actions: string[] = [];
+        if (task.status === "pending") actions.push("▸ Start (in_progress)");
+        if (task.status === "in_progress") actions.push("✓ Complete");
+        if (task.status === "completed") actions.push(task.hidden ? "Restore" : "Hide");
+        if (task.status === "pending" && store.listGroups().length > 0) actions.push("Move to group");
+        if (task.status === "pending" && task.groupId) actions.push("Ungroup");
+        actions.push("✗ Delete permanently", "← Back");
+        const group = task.groupId ? `\nGroup: ${task.groupId}` : "";
+        const readiness = store.getReadiness(task.id);
+        const blocked = task.status === "pending" && !readiness.ready ? `\nBlocked: ${readiness.blockers.join("; ")}` : "";
+        const action = await ui.select(`#${task.id} [${task.status}] ${task.subject}${group}${blocked}\n${task.description}`, actions);
 
-        if (task.status === "pending") {
-          actions.push("▸ Start (in_progress)");
+        try {
+          if (action === "▸ Start (in_progress)") {
+            store.update(taskId, { status: "in_progress" });
+            widget.setActiveTask(taskId);
+          } else if (action === "✓ Complete") {
+            const previouslyReady = readyAgentTaskIds();
+            store.update(taskId, { status: "completed" });
+            await cascadeNewlyReady(previouslyReady);
+            autoClear.trackCompletion(taskId, cadence.currentTurn);
+            widget.setActiveTask(taskId, false);
+          } else if (action === "Hide") {
+            store.hide(taskId);
+          } else if (action === "Restore") {
+            store.update(taskId, { hidden: false });
+            autoClear.clearTaskCountdown(taskId);
+          } else if (action === "Move to group") {
+            const groups = store.listGroups();
+            const selected = await ui.select("Move to task group", [...groups.map(group => `${group.id}: ${group.subject}`), "← Back"]);
+            const picked = groups.find(group => `${group.id}: ${group.subject}` === selected);
+            if (picked) store.update(taskId, { groupId: picked.id });
+          } else if (action === "Ungroup") {
+            store.update(taskId, { groupId: null });
+          } else if (action === "✗ Delete permanently") {
+            if (await ui.confirm("Delete task permanently?", `Delete #${task.id} and its retained result?`)) {
+              store.delete(taskId);
+              widget.setActiveTask(taskId, false);
+            }
+          } else {
+            return viewTasks();
+          }
+        } catch (error) {
+          ui.notify(error instanceof Error ? error.message : String(error), "warning");
         }
-        if (task.status === "in_progress") {
-          actions.push("✓ Complete");
-        }
-        actions.push("✗ Delete");
-        actions.push("← Back");
-
-        const title = `#${task.id} [${task.status}] ${task.subject}\n${task.description}`;
-        const action = await ui.select(title, actions);
-
-        if (action === "▸ Start (in_progress)") {
-          store.update(taskId, { status: "in_progress" });
-          widget.setActiveTask(taskId);
-          widget.update();
-          return viewTasks();
-        } else if (action === "✓ Complete") {
-          store.update(taskId, { status: "completed" });
-          autoClear.trackCompletion(taskId, cadence.currentTurn);
-          widget.setActiveTask(taskId, false);
-          widget.update();
-          return viewTasks();
-        } else if (action === "✗ Delete") {
-          store.update(taskId, { status: "deleted" });
-          widget.setActiveTask(taskId, false);
-          widget.update();
-          return viewTasks();
-        }
+        widget.update();
         return viewTasks();
       };
-
-      const settingsMenu = (): Promise<void> =>
-        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY, ctx.cwd);
 
       const createTask = async (): Promise<void> => {
         const subject = await ui.input("Task subject");
         if (!subject) return mainMenu();
         const description = await ui.input("Task description");
         if (!description) return mainMenu();
-
-        store.create(subject, description);
+        const groups = store.listGroups();
+        let groupId: string | undefined;
+        if (groups.length > 0) {
+          const choices = ["Ungrouped", ...groups.map(group => `${group.id}: ${group.subject}`)];
+          const selected = await ui.select("Task group", choices);
+          if (!selected) return mainMenu();
+          groupId = groups.find(group => `${group.id}: ${group.subject}` === selected)?.id;
+        }
+        autoClear.startNewBatch();
+        store.create(subject, description, undefined, undefined, groupId);
         widget.update();
         return mainMenu();
       };
 
+      const createGroup = async (): Promise<void> => {
+        const subject = await ui.input("Task group subject");
+        if (!subject) return mainMenu();
+        const description = await ui.input("Task group description (optional)");
+        store.createGroup(subject, description || undefined);
+        widget.update();
+        return mainMenu();
+      };
+
+      const manageGroups = async (): Promise<void> => {
+        const groups = orderTaskGroups(store.listGroups());
+        if (groups.length === 0) return mainMenu();
+        const choices = [...groups.map(group => `${group.id}: ${group.subject}`), "← Back"];
+        const selected = await ui.select("Task groups", choices);
+        if (!selected || selected === "← Back") return mainMenu();
+        const group = groups.find(item => `${item.id}: ${item.subject}` === selected);
+        if (!group) return manageGroups();
+        const action = await ui.select(`${group.id}: ${group.subject}`, [
+          "Rename",
+          "Edit description",
+          "Add prerequisite",
+          "Remove prerequisite",
+          "Delete group",
+          "← Back",
+        ]);
+        try {
+          if (action === "Rename") {
+            const subject = await ui.input("Task group subject", group.subject);
+            if (subject) store.updateGroup(group.id, { subject });
+          } else if (action === "Edit description") {
+            const description = await ui.input("Task group description", group.description ?? "");
+            if (description !== undefined) store.updateGroup(group.id, { description: description || null });
+          } else if (action === "Add prerequisite") {
+            const candidates = groups.filter(item => item.id !== group.id && !group.blockedBy.includes(item.id));
+            if (candidates.length === 0) ui.notify("No task groups are available as new prerequisites", "info");
+            else {
+              const prerequisite = await ui.select("Prerequisite group", candidates.map(item => `${item.id}: ${item.subject}`));
+              const picked = candidates.find(item => `${item.id}: ${item.subject}` === prerequisite);
+              if (picked) store.updateGroup(group.id, { addBlockedBy: [picked.id] });
+            }
+          } else if (action === "Remove prerequisite") {
+            const candidates = groups.filter(item => group.blockedBy.includes(item.id));
+            if (candidates.length === 0) ui.notify("This task group has no prerequisites", "info");
+            else {
+              const prerequisite = await ui.select("Remove prerequisite", candidates.map(item => `${item.id}: ${item.subject}`));
+              const picked = candidates.find(item => `${item.id}: ${item.subject}` === prerequisite);
+              if (picked) store.updateGroup(group.id, { removeBlockedBy: [picked.id] });
+            }
+          } else if (action === "Delete group") {
+            if (await ui.confirm("Delete task group?", "Tasks remain and become ungrouped.")) store.deleteGroup(group.id);
+          } else {
+            return manageGroups();
+          }
+        } catch (error) {
+          ui.notify(error instanceof Error ? error.message : String(error), "warning");
+        }
+        widget.update();
+        return manageGroups();
+      };
+
+      const settingsMenu = (): Promise<void> => openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY, ctx.cwd);
       await mainMenu();
     },
   });

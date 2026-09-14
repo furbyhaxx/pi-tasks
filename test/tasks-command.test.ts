@@ -38,6 +38,7 @@ function scriptedUI(script: Answer[]) {
       const answer = script.shift();
       return typeof answer === "number" ? undefined : answer;
     },
+    async confirm() { return true; },
     async custom(factory: any) {
       // The factory is not invoked: it builds a real SettingsList, which needs pi's
       // global theme initialized. What /tasks owns is the routing, asserted below.
@@ -84,7 +85,7 @@ const create = (subject: string) => async (mock: ReturnType<typeof mockPi>) => {
 describe("/tasks main menu", () => {
   it("offers only view and create when the list is empty", async () => {
     const { selects } = await runTasks([undefined], async () => {});
-    expect(selects[0].choices).toEqual(["View all tasks (0)", "Create task", "Settings"]);
+    expect(selects[0].choices).toEqual(["View all tasks (0)", "Create task", "Create task group", "Settings"]);
   });
 
   it("offers the clear actions with their counts once tasks exist", async () => {
@@ -96,8 +97,9 @@ describe("/tasks main menu", () => {
     expect(selects[0].choices).toEqual([
       "View all tasks (2)",
       "Create task",
-      "Clear completed (1)",
-      "Clear all (2)",
+      "Create task group",
+      "Hide completed (1)",
+      "Delete all (2 tasks, 0 groups)",
       "Settings",
     ]);
   });
@@ -124,19 +126,19 @@ describe("/tasks task detail", () => {
   });
 
   it("deletes a task", async () => {
-    const { mock } = await runTasks([0, 0, "✗ Delete"], create("Work"));
+    const { mock } = await runTasks([0, 0, "✗ Delete permanently"], create("Work"));
     expect((await mock.executeTool("TaskList", {})).content[0].text).toBe("No tasks found");
   });
 
   it("offers Complete only for in-progress tasks", async () => {
     const { selects } = await runTasks([0, 0, undefined], create("Work"));
-    expect(selects[2].choices).toEqual(["▸ Start (in_progress)", "✗ Delete", "← Back"]);
+    expect(selects[2].choices).toEqual(["▸ Start (in_progress)", "✗ Delete permanently", "← Back"]);
   });
 
   it("acts on the task whose row was picked, not on an ID inside its subject", async () => {
     // The row reads "◻ #1 [pending] Fix #42 in the parser" — the ID must come from
     // the row's own marker, not from the first number that happens to follow a '#'.
-    const { mock } = await runTasks([0, 0, "✗ Delete"], create("Fix #42 in the parser"));
+    const { mock } = await runTasks([0, 0, "✗ Delete permanently"], create("Fix #42 in the parser"));
     expect((await mock.executeTool("TaskList", {})).content[0].text).toBe("No tasks found");
   });
 
@@ -144,7 +146,7 @@ describe("/tasks task detail", () => {
     // Nothing stops a hand-written glyph from looking like a task marker.
     config.current = { glyphs: { pending: "#12" } };
 
-    const { mock } = await runTasks([0, 0, "✗ Delete"], create("Work"));
+    const { mock } = await runTasks([0, 0, "✗ Delete permanently"], create("Work"));
 
     expect((await mock.executeTool("TaskList", {})).content[0].text).toBe("No tasks found");
   });
@@ -170,7 +172,7 @@ describe("/tasks task detail", () => {
 
 describe("/tasks clearing", () => {
   it("clears only completed tasks", async () => {
-    const { mock } = await runTasks(["Clear completed (1)", undefined], async m => {
+    const { mock } = await runTasks(["Hide completed (1)", undefined], async m => {
       await create("Done")(m);
       await create("Open")(m);
       await m.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
@@ -181,7 +183,7 @@ describe("/tasks clearing", () => {
   });
 
   it("clears every task and removes the now-empty session file", async () => {
-    const { mock } = await runTasks(["Clear all (2)", undefined], async m => {
+    const { mock } = await runTasks(["Delete all (2 tasks, 0 groups)", undefined], async m => {
       await create("One")(m);
       await create("Two")(m);
     });
@@ -190,13 +192,36 @@ describe("/tasks clearing", () => {
   });
 
   it("keeps the file when clearing completed leaves work behind", async () => {
-    await runTasks(["Clear completed (1)", undefined], async m => {
+    await runTasks(["Hide completed (1)", undefined], async m => {
       await create("Done")(m);
       await create("Open")(m);
       await m.executeTool("TaskUpdate", { taskId: "1", status: "completed" });
     });
     expect(existsSync(taskFile)).toBe(true);
-    expect(new TaskStore(taskFile).list().map(t => t.subject)).toEqual(["Open"]);
+    const retained = new TaskStore(taskFile);
+    expect(retained.listVisible().map(t => t.subject)).toEqual(["Open"]);
+    expect(retained.get("1")).toMatchObject({ subject: "Done", hidden: true });
+  });
+});
+
+describe("/tasks task groups and history", () => {
+  it("creates a task group from the menu", async () => {
+    const { mock } = await runTasks(
+      ["Create task group", "Planning", "Shared context", undefined],
+      async () => {},
+    );
+    const list = (await mock.executeTool("TaskList", {})).content[0].text;
+    expect(list).toContain("g1: Planning");
+    expect(list).toContain("0/0 completed");
+  });
+
+  it("restores a hidden task from history", async () => {
+    const { mock } = await runTasks(["Show history (1)", 0, "Restore", undefined], async m => {
+      await create("Done")(m);
+      await m.executeTool("TaskUpdate", { taskId: "1", status: "completed", hidden: true });
+    });
+    const task = (await mock.executeTool("TaskGet", { taskId: "1" })).content[0].text;
+    expect(task).not.toContain("Visibility: hidden history");
   });
 });
 

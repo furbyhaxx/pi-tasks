@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dependency-gated task groups with retained completion history.** `TaskGroupCreate` and `TaskGroupUpdate` add one organizational level whose prerequisite groups gate every downstream task, with cycle validation shared across task and group edges. Automatic cleanup now hides completed tasks instead of deleting their descriptions, results, memberships, and dependency links; history remains available through `TaskList(includeHidden: true)` and `/tasks`, while explicit deletion remains permanent.
+
 ## [0.9.0] - 2026-08-24
 
 ### Added

@@ -25,18 +25,18 @@ describe("auto-clear: on_task_complete mode", () => {
     expect(store.get("1")!.status).toBe("completed");
   });
 
-  it("clears completed task after REMINDER_INTERVAL turns", () => {
+  it("hides completed task after REMINDER_INTERVAL turns", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
 
     // Turn 5 = turn 1 + 4 (REMINDER_INTERVAL)
     manager.onTurnStart(5);
-    expect(store.get("1")).toBeUndefined();
-    expect(store.list()).toHaveLength(0);
+    expect(store.get("1")?.hidden).toBe(true);
+    expect(store.listVisible()).toHaveLength(0);
   });
 
-  it("clears each task independently based on its own completion turn", () => {
+  it("hides each task independently based on its own completion turn", () => {
     store.create("Task A", "Desc");
     store.create("Task B", "Desc");
 
@@ -48,15 +48,15 @@ describe("auto-clear: on_task_complete mode", () => {
 
     // Turn 5: Task A expires (1+4), Task B still lingers (3+4=7)
     manager.onTurnStart(5);
-    expect(store.get("1")).toBeUndefined();
-    expect(store.get("2")).toBeDefined();
+    expect(store.get("1")?.hidden).toBe(true);
+    expect(store.get("2")?.hidden).not.toBe(true);
 
     // Turn 7: Task B expires
     manager.onTurnStart(7);
-    expect(store.get("2")).toBeUndefined();
+    expect(store.get("2")?.hidden).toBe(true);
   });
 
-  it("does not clear pending or in_progress tasks", () => {
+  it("does not hide pending or in_progress tasks", () => {
     store.create("Pending", "Desc");
     store.create("In Progress", "Desc");
     store.create("Completed", "Desc");
@@ -67,10 +67,10 @@ describe("auto-clear: on_task_complete mode", () => {
     manager.onTurnStart(5);
     expect(store.get("1")).toBeDefined(); // pending — untouched
     expect(store.get("2")).toBeDefined(); // in_progress — untouched
-    expect(store.get("3")).toBeUndefined(); // completed — cleared
+    expect(store.get("3")?.hidden).toBe(true); // completed — retained but hidden
   });
 
-  it("cleans up dependency edges when auto-clearing", () => {
+  it("retains dependency edges when auto-hiding", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");
     store.update("1", { addBlocks: ["2"] });
@@ -78,11 +78,23 @@ describe("auto-clear: on_task_complete mode", () => {
     manager.trackCompletion("1", 1);
 
     manager.onTurnStart(5);
-    expect(store.get("1")).toBeUndefined();
-    expect(store.get("2")!.blockedBy).toEqual([]);
+    expect(store.get("1")?.hidden).toBe(true);
+    expect(store.get("2")!.blockedBy).toEqual(["1"]);
   });
 
-  it("returns true when tasks are cleared", () => {
+  it("does not re-hide a restored task on its old countdown", () => {
+    store.create("Task", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+    store.hide("1");
+    store.update("1", { hidden: false });
+    manager.clearTaskCountdown("1");
+
+    manager.onTurnStart(5);
+    expect(store.get("1")?.hidden).not.toBe(true);
+  });
+
+  it("returns true when tasks are hidden", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
@@ -128,7 +140,7 @@ describe("auto-clear: on_list_complete mode", () => {
     expect(store.list()).toHaveLength(2);
   });
 
-  it("clears all completed tasks after REMINDER_INTERVAL turns when all are completed", () => {
+  it("hides all completed tasks after REMINDER_INTERVAL turns when all are completed", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { status: "completed" });
@@ -136,7 +148,7 @@ describe("auto-clear: on_list_complete mode", () => {
     manager.trackCompletion("2", 1);
 
     manager.onTurnStart(5);
-    expect(store.list()).toHaveLength(0);
+    expect(store.listVisible()).toHaveLength(0);
   });
 
   it("resets countdown when a new task is created before REMINDER_INTERVAL", () => {
@@ -171,7 +183,7 @@ describe("auto-clear: on_list_complete mode", () => {
     expect(store.list()).toHaveLength(2); // both still here
   });
 
-  it("returns true when tasks are cleared", () => {
+  it("returns true when tasks are hidden", () => {
     store.create("Task", "Desc");
     store.update("1", { status: "completed" });
     manager.trackCompletion("1", 1);
@@ -190,7 +202,7 @@ describe("auto-clear: never mode", () => {
     manager = new AutoClearManager(() => store, () => "never");
   });
 
-  it("never clears completed tasks regardless of turns", () => {
+  it("never hides completed tasks regardless of turns", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { status: "completed" });
@@ -232,7 +244,7 @@ describe("auto-clear: dynamic mode switching", () => {
     mode = "on_task_complete";
     manager.trackCompletion("1", 5);
     manager.onTurnStart(9);
-    expect(store.get("1")).toBeUndefined();
+    expect(store.get("1")?.hidden).toBe(true);
   });
 });
 
@@ -256,7 +268,7 @@ describe("auto-clear: store getter (session switch)", () => {
     expect(store.get("1")!.subject).toBe("New task");
   });
 
-  it("clears from new store, not old store", () => {
+  it("hides in the new store, not old store", () => {
     let store = new TaskStore();
     const manager = new AutoClearManager(() => store, () => "on_task_complete");
 
@@ -267,7 +279,7 @@ describe("auto-clear: store getter (session switch)", () => {
     manager.trackCompletion("1", 1);
 
     manager.onTurnStart(5);
-    expect(store.get("1")).toBeUndefined(); // cleared from new store
+    expect(store.get("1")?.hidden).toBe(true); // hidden in the new store
   });
 });
 
@@ -316,7 +328,7 @@ describe("auto-clear: reset (new session)", () => {
     // Re-track after reset with new turn baseline
     manager.trackCompletion("1", 10);
     manager.onTurnStart(14);
-    expect(store.get("1")).toBeUndefined();
+    expect(store.get("1")?.hidden).toBe(true);
   });
 });
 
@@ -341,7 +353,7 @@ describe("auto-clear: starting a new batch", () => {
       // countdown stops ticking with it.
       manager.onRunEnded();
       manager.startNewBatch();
-      expect(store.list()).toHaveLength(0);
+      expect(store.listVisible()).toHaveLength(0);
 
       // IDs are not reused — the new task is #3.
       expect(store.create("C", "Desc").id).toBe("3");
@@ -395,10 +407,10 @@ describe("auto-clear: starting a new batch", () => {
 
     manager.onRunEnded();
     manager.startNewBatch();
-    expect(store.list()).toHaveLength(0);
+    expect(store.listVisible()).toHaveLength(0);
   });
 
-  it("clears a list a subagent finished after its run ended", () => {
+  it("hides a list a subagent finished after its run ended", () => {
     const store = new TaskStore();
     const manager = new AutoClearManager(() => store, () => "on_list_complete");
     store.create("Cascaded", "Desc");
@@ -409,7 +421,7 @@ describe("auto-clear: starting a new batch", () => {
     manager.trackCompletion("1", 1);
 
     manager.startNewBatch();
-    expect(store.list()).toHaveLength(0);
+    expect(store.listVisible()).toHaveLength(0);
   });
 
   it("arms once per run, so the batch it starts is not swept mid-build", () => {
@@ -426,7 +438,7 @@ describe("auto-clear: starting a new batch", () => {
     // Still the same run: the next task joins that batch rather than replacing it.
     manager.startNewBatch();
     store.create("Second of the new batch", "Desc");
-    expect(store.list()).toHaveLength(2);
+    expect(store.listVisible()).toHaveLength(2);
   });
 
   it("does not cut the new batch's own countdown short", () => {
@@ -441,8 +453,9 @@ describe("auto-clear: starting a new batch", () => {
     completeAll(store, manager, 3);
 
     expect(manager.onTurnStart(4)).toBe(false); // 3 + 4 not reached
-    expect(store.list()).toHaveLength(1);
+    expect(store.listVisible()).toHaveLength(1);
     expect(manager.onTurnStart(7)).toBe(true);
+    expect(store.listVisible()).toHaveLength(0);
   });
 
   it("reset drops the armed boundary", () => {

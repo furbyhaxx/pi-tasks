@@ -178,7 +178,7 @@ describe("session_start with a persisted list", () => {
     });
   }
 
-  it("wipes an all-completed list on startup, leaving no session file behind", async () => {
+  it("hides an all-completed list on startup while retaining the session file", async () => {
     seed("s1", ["completed", "completed"]);
     const mock = mockPi();
     initExtension(mock.pi as any);
@@ -186,8 +186,22 @@ describe("session_start with a persisted list", () => {
     const ctx = ctxFor("s1");
     await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
 
-    expect(existsSync(sessionFile("s1"))).toBe(false);
+    expect(existsSync(sessionFile("s1"))).toBe(true);
+    expect(new TaskStore(sessionFile("s1")).list().every(task => task.hidden)).toBe(true);
     expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+  });
+
+  it("keeps an all-completed list visible on startup when cleanup is disabled", async () => {
+    config.current = { autoClearCompleted: "never" };
+    seed("s1", ["completed"]);
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    const ctx = ctxFor("s1");
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+
+    expect(new TaskStore(sessionFile("s1")).get("1")?.hidden).not.toBe(true);
+    expect(ctx.ui.setWidget).toHaveBeenCalled();
   });
 
   it("keeps an all-completed list on resume and shows the widget", async () => {
@@ -273,9 +287,8 @@ describe("session-global scope", () => {
     expect(existsSync(globalSessionTasksDir(cwd))).toBe(false);
   });
 
-  it("reclaims the global directory once its last session file is gone", async () => {
-    // Nothing else ever revisits a workspace whose tasks are gone, so global
-    // storage would otherwise grow one empty directory per workspace opened.
+  it("retains the global directory while completed history exists", async () => {
+    // Hidden history remains durable and therefore keeps its backing directory.
     const seeded = new TaskStore(globalFile("s1"));
     seeded.update(seeded.create("Task 1", "d").id, { status: "completed" });
     expect(existsSync(globalSessionTasksDir(cwd))).toBe(true);
@@ -284,7 +297,8 @@ describe("session-global scope", () => {
     initExtension(mock.pi as any);
     await mock.fireLifecycle("session_start", { reason: "startup" }, ctxFor("s1"));
 
-    expect(existsSync(globalFile("s1"))).toBe(false);
-    expect(existsSync(globalSessionTasksDir(cwd))).toBe(false);
+    expect(existsSync(globalFile("s1"))).toBe(true);
+    expect(new TaskStore(globalFile("s1")).get("1")?.hidden).toBe(true);
+    expect(existsSync(globalSessionTasksDir(cwd))).toBe(true);
   });
 });

@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import initExtension from "../src/index.js";
 import { sessionTaskFile } from "../src/task-paths.js";
+import { TaskStore } from "../src/task-store.js";
 import { mockPi, mockSessionCtx } from "./helpers/mock-pi.js";
 
 const config = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
@@ -158,7 +159,7 @@ describe("auto-clear across batches", () => {
     expect(await listOf(mock, ctx)).toContain("Task 0");
   });
 
-  it("removes the emptied session file when the countdown clears the list", async () => {
+  it("retains completed history in the session file after the countdown hides it", async () => {
     const { mock, ctx } = await start();
     await runAndFinish(mock, ctx, 1);
     expect(existsSync(sessionFile("s1"))).toBe(true);
@@ -166,9 +167,9 @@ describe("auto-clear across batches", () => {
     // The conversation continues without new tasks, so the turn countdown expires.
     for (let i = 0; i < 5; i++) await mock.fireLifecycle("turn_start", {}, ctx);
 
-    expect(existsSync(sessionFile("s1"))).toBe(false);
-    // Only the file goes. `.pi/tasks/` is left standing, as every release so far
-    // has left it — `.pi/` holds project config that is not ours to remove.
+    expect(existsSync(sessionFile("s1"))).toBe(true);
+    const retained = new TaskStore(sessionFile("s1")).get("1");
+    expect(retained).toMatchObject({ status: "completed", hidden: true });
     expect(existsSync(join(cwd, ".pi", "tasks"))).toBe(true);
   });
 });

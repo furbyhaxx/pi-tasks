@@ -96,21 +96,21 @@ export async function openSettingsMenu(
       },
       {
         id: "hiddenAt",
-        label: "Hidden tasks position",
+        label: "Overflow position",
         description:
-          '"bottom" hides tasks from the end of the list. ' +
-          '"top" hides tasks from the start (useful with status sort to collapse completed tasks).',
+          '"bottom" truncates rows from the end of the widget. ' +
+          '"top" truncates rows from the start (useful with status sort to keep active work visible).',
         currentValue: cfg.hiddenAt ?? "bottom",
         values: ["bottom", "top"],
       },
       {
         id: "autoClearCompleted",
-        label: "Auto-clear completed tasks",
+        label: "Auto-hide completed tasks",
         description:
-          "never: completed tasks stay visible until manually cleared. " +
-          "on_list_complete: cleared automatically after all tasks are done. " +
-          "on_task_complete: each task cleared shortly after it completes. " +
-          `Clearing lags ~${clearDelayTurns} turns, or happens right away when a later batch of work starts.`,
+          "Cleanup retains task records and results as history. never: completed tasks stay visible. " +
+          "on_list_complete: hide them after all tasks are done. " +
+          "on_task_complete: hide each task shortly after it completes. " +
+          `Hiding lags ~${clearDelayTurns} turns, or happens when a later batch starts.`,
         currentValue: cfg.autoClearCompleted ?? "on_list_complete",
         values: ["never", "on_list_complete", "on_task_complete"],
       },

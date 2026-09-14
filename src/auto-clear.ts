@@ -1,9 +1,9 @@
 /**
- * auto-clear.ts — Turn-based auto-clearing of completed tasks.
+ * auto-clear.ts — Turn-based hiding of completed tasks.
  *
  * Two modes:
- * - "on_task_complete": each completed task gets its own REMINDER_INTERVAL countdown, deleted individually
- * - "on_list_complete": countdown starts when ALL tasks are completed, cleared as a batch
+ * - "on_task_complete": each completed task gets its own REMINDER_INTERVAL countdown, then is hidden
+ * - "on_list_complete": countdown starts when ALL tasks are completed, then they are hidden as a batch
  *
  * Both use the same turn delay (REMINDER_INTERVAL) for consistency.
  *
@@ -66,6 +66,12 @@ export class AutoClearManager {
     this.allCompletedAtTurn = null;
   }
 
+  /** A restored completed task must not be hidden by its old countdown. */
+  clearTaskCountdown(taskId: string): void {
+    this.completedAtTurn.delete(taskId);
+    this.allCompletedAtTurn = null;
+  }
+
   /** No automatic retry, compaction or queued continuation is coming, so the list as
    *  it stands is this run's final one. Also true of a list carried into a resumed or
    *  forked session: the run that produced it ended with the session before. */
@@ -89,7 +95,7 @@ export class AutoClearManager {
     if (!afterFinishedRun || this.getMode() === "never") return;
     const tasks = this.getStore().list();
     if (tasks.length > 0 && tasks.every(t => t.status === "completed")) {
-      this.getStore().clearCompleted();
+      this.getStore().hideCompleted();
       this.completedAtTurn.clear();
     }
   }
@@ -102,8 +108,8 @@ export class AutoClearManager {
   }
 
   /**
-   * Called on each turn start. Deletes tasks whose linger period has expired.
-   * Returns true if any tasks were cleared.
+   * Called on each turn start. Hides tasks whose linger period has expired.
+   * Returns true if any tasks were hidden.
    */
   onTurnStart(currentTurn: number): boolean {
     const mode = this.getMode();
@@ -116,14 +122,14 @@ export class AutoClearManager {
           // Task was deleted or reverted — drop stale tracking entry
           this.completedAtTurn.delete(taskId);
         } else if (currentTurn - turn >= this.clearDelayTurns) {
-          this.getStore().delete(taskId);
+          this.getStore().hide(taskId);
           this.completedAtTurn.delete(taskId);
           cleared = true;
         }
       }
     } else if (mode === "on_list_complete" && this.allCompletedAtTurn !== null) {
       if (currentTurn - this.allCompletedAtTurn >= this.clearDelayTurns) {
-        this.getStore().clearCompleted();
+        this.getStore().hideCompleted();
         this.allCompletedAtTurn = null;
         cleared = true;
       }
