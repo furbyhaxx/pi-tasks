@@ -164,6 +164,39 @@ describe("/tasks task detail", () => {
     expect(selects[1].choices).toEqual(["[ ] #1 [pending] Work", "← Back"]);
   });
 
+  it("shows groups and indents their tasks", async () => {
+    const { selects } = await runTasks([0, undefined], async m => {
+      await m.executeTool("TaskGroupCreate", { subject: "Planning" });
+      await m.executeTool("TaskCreate", { subject: "Design", description: "d", groupId: "g1" });
+      await m.executeTool("TaskCreate", { subject: "Loose", description: "d" });
+    });
+
+    expect(selects[1].choices).toEqual([
+      "◻ g1: Planning (0/1 completed)",
+      "  ◻ #1 [pending] Design",
+      "◻ Ungrouped",
+      "  ◻ #2 [pending] Loose",
+      "← Back",
+    ]);
+  });
+
+  it("opens the indented task row that was picked", async () => {
+    const { mock } = await runTasks([0, "  ◻ #1 [pending] Design", "✗ Delete permanently"], async m => {
+      await m.executeTool("TaskGroupCreate", { subject: "Planning" });
+      await m.executeTool("TaskCreate", { subject: "Design", description: "d", groupId: "g1" });
+    });
+
+    expect((await mock.executeTool("TaskList", {})).content[0].text).not.toContain("Design");
+  });
+
+  it("shows empty groups in the task list", async () => {
+    const { selects } = await runTasks([0, undefined], async m => {
+      await m.executeTool("TaskGroupCreate", { subject: "Planning" });
+    });
+
+    expect(selects[1].choices).toEqual(["◻ g1: Planning (0/0 completed)", "← Back"]);
+  });
+
   it("shows a placeholder screen when there is nothing to view", async () => {
     const { selects } = await runTasks([0, undefined], async () => {});
     expect(selects[1]).toEqual({ title: "No tasks", choices: ["← Back"] });

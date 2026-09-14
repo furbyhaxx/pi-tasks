@@ -33,7 +33,7 @@ import { resolveTaskGlyphs } from "./task-glyphs.js";
 import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { orderTaskGroups, TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
-import type { Task } from "./types.js";
+import type { Task, TaskGroup } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
 
@@ -1450,20 +1450,48 @@ Set up task dependencies:
       const viewTasks = async (includeHidden = viewingHistory): Promise<void> => {
         viewingHistory = includeHidden;
         const tasks = store.list().filter(task => includeHidden || !task.hidden);
-        if (tasks.length === 0) {
+        const groups = orderTaskGroups(store.listGroups());
+        if (tasks.length === 0 && groups.length === 0) {
           await ui.select(includeHidden ? "No task history" : "No tasks", ["← Back"]);
           return mainMenu();
         }
-        const choices = tasks.map(task => {
-          const group = task.groupId ? ` ${task.groupId}` : "";
-          const hidden = task.hidden ? " [hidden]" : "";
-          return `${statusGlyph(task.status)} #${task.id}${group} [${task.status}] ${task.subject}${hidden}`;
+
+        type TaskListRow = { kind: "group"; group: TaskGroup } | { kind: "task"; task: Task } | { kind: "back" };
+        const rows: TaskListRow[] = [];
+        if (groups.length > 0) {
+          for (const group of groups) {
+            const groupTasks = tasks.filter(task => task.groupId === group.id);
+            const summary = store.getGroupSummary(group.id);
+            if (groupTasks.length === 0 && (summary?.total ?? 0) > 0) continue;
+            rows.push({ kind: "group", group });
+            rows.push(...groupTasks.map(task => ({ kind: "task" as const, task })));
+          }
+          const ungrouped = tasks.filter(task => !task.groupId || !store.getGroup(task.groupId));
+          if (ungrouped.length > 0) {
+            rows.push({ kind: "group", group: { id: "", subject: "Ungrouped", blockedBy: [], createdAt: 0, updatedAt: 0 } });
+            rows.push(...ungrouped.map(task => ({ kind: "task" as const, task })));
+          }
+        } else {
+          rows.push(...tasks.map(task => ({ kind: "task" as const, task })));
+        }
+        rows.push({ kind: "back" });
+
+        const choices = rows.map(row => {
+          if (row.kind === "back") return "← Back";
+          if (row.kind === "group") {
+            if (!row.group.id) return `${statusGlyph("pending")} Ungrouped`;
+            const summary = store.getGroupSummary(row.group.id);
+            const counts = summary ? ` (${summary.completed}/${summary.total} completed)` : "";
+            return `${statusGlyph(summary?.complete ? "completed" : summary?.inProgress ? "in_progress" : "pending")} ${row.group.id}: ${row.group.subject}${counts}`;
+          }
+          const hidden = row.task.hidden ? " [hidden]" : "";
+          const indent = groups.length > 0 ? "  " : "";
+          return `${indent}${statusGlyph(row.task.status)} #${row.task.id} [${row.task.status}] ${row.task.subject}${hidden}`;
         });
-        choices.push("← Back");
         const selected = await ui.select(includeHidden ? "Task history" : "Tasks", choices);
         if (!selected || selected === "← Back") return mainMenu();
-        const picked = tasks[choices.indexOf(selected)];
-        return picked ? viewTaskDetail(picked.id) : viewTasks(includeHidden);
+        const picked = rows[choices.indexOf(selected)];
+        return picked?.kind === "task" ? viewTaskDetail(picked.task.id) : viewTasks(includeHidden);
       };
 
       const viewTaskDetail = async (taskId: string): Promise<void> => {
