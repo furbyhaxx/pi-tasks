@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import initExtension from "../src/index.js";
-import { flush, installSubagentsMock, mockPi } from "./helpers/mock-pi.js";
+import { flush, installBackgroundJobsMock, installSubagentsMock, mockPi } from "./helpers/mock-pi.js";
 
 beforeEach(() => { process.env.PI_TASKS = "off"; });
 afterEach(() => { delete process.env.PI_TASKS; });
@@ -245,5 +245,43 @@ describe("TaskStop", () => {
     await expect(mock.executeTool("TaskStop", { task_id: "1" }))
       .rejects.toThrow("No running background process for task 1");
     expect(rpc.stopped).toEqual([]);
+  });
+});
+
+/** With the optional pi-background-jobs extension loaded, only `job-…` ids route
+ *  to it: task and agent ids keep the paths every test above pins. */
+describe("TaskOutput/TaskStop — non-job ids with background jobs loaded", () => {
+  it("leaves a task-store miss on the task path", async () => {
+    const mock = mockPi();
+    const jobs = installBackgroundJobsMock(mock.pi);
+    const rpc = installSubagentsMock(mock.pi);
+    initExtension(mock.pi as any);
+    try {
+      await expect(mock.executeTool("TaskOutput", { task_id: "99", block: false, timeout: 30000 }))
+        .rejects.toThrow("No task found with ID 99");
+      await expect(mock.executeTool("TaskStop", { task_id: "99" }))
+        .rejects.toThrow("No running background process for task 99");
+      expect(jobs.requests.output).toEqual([]);
+      expect(jobs.requests.stop).toEqual([]);
+    } finally {
+      jobs.unsub();
+      rpc.unsub();
+    }
+  });
+
+  it("resolves an agent id through the task store, not the job store", async () => {
+    const mock = mockPi();
+    const jobs = installBackgroundJobsMock(mock.pi);
+    const rpc = installSubagentsMock(mock.pi);
+    initExtension(mock.pi as any);
+    try {
+      await launchAgentTask(mock);
+      const res = await mock.executeTool("TaskOutput", { task_id: "agent-1", block: false, timeout: 30000 });
+      expect(res.content[0].text).toBe("Task #1 [in_progress] — subagent agent-1");
+      expect(jobs.requests.output).toEqual([]);
+    } finally {
+      jobs.unsub();
+      rpc.unsub();
+    }
   });
 });

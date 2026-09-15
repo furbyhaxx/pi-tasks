@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opening Jobs from `/tasks` no longer leaves a hidden task selector over the Jobs overlay.** The menu returns immediately after the background-jobs RPC accepts the open, including warning paths.
+
 ### Added
+
+- **`TaskOutput` and `TaskStop` accept `job-…` ids from the optional [`@furbyhaxx/pi-background-jobs`](https://github.com/furbyhaxx/pi-background-jobs) extension.** A job id is routed over the events RPC (`background-jobs:rpc:{ping,list,output,stop,open}`) before the task store is consulted, and the job branch only delegates — it never completes a task or changes a dependency, because a job exiting says nothing about the planning task that happened to be in progress. `TaskOutput` keeps its millisecond `timeout` as the job's wait budget and returns status, intent, a bounded tail, and the full output path; `TaskStop` reports only a confirmed termination and propagates the extension's errors. Without the extension a job-shaped id fails with `Background jobs extension is not loaded`, while every other id keeps the existing task/agent behavior; a missed handshake is re-probed on the next call, so load order and restarts do not leave it cached as unavailable. `/tasks` also shows `Jobs (N)` only while the companion is available and opens its existing `/jobs` overlay.
 
 - **`TaskCreate` accepts `blockedBy` at creation time.** A dependent task can now be created already wired to the prerequisites it needs, instead of a create followed by a `TaskUpdate` that could leave a task briefly runnable. It takes IDs of tasks that already exist — the ones earlier calls returned, never a predicted ID — writes both sides of each edge, deduplicates, and rejects the whole call atomically when an ID is unknown or the edge would close a cycle, including one formed through group membership.
 

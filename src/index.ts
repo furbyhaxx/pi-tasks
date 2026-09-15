@@ -20,6 +20,7 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { AutoClearManager } from "./auto-clear.js";
+import { createBackgroundJobsRpc, formatJobOutput, formatJobStop, JOB_ID } from "./background-jobs-rpc.js";
 import { ProcessTracker } from "./process-tracker.js";
 import {
   type CadenceConfig,
@@ -270,6 +271,15 @@ export default function (pi: ExtensionAPI) {
 
   checkSubagentsVersion();
   pi.events.on("subagents:ready", () => checkSubagentsVersion());
+
+  // ── Background-jobs integration (optional companion) ──
+  // TaskOutput/TaskStop route `job-…` ids to the extension that owns them; a job
+  // is not a task and neither branch may touch the task store. The client owns
+  // its own availability probe (and its `background-jobs:ready` re-probe), so a
+  // job extension binding after pi-tasks is still found; its helpers are what a
+  // `/tasks` menu entry will call once the frontend adds one.
+  const jobsRpc = createBackgroundJobsRpc(pi.events);
+  pi.on("session_shutdown", () => jobsRpc.dispose());
 
   /** Build a prompt for a task being executed by a subagent.
    *  Injects completed dependency results so cascaded agents have context from prerequisites.
@@ -588,6 +598,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
+    void jobsRpc.checkBackgroundJobs();
 
     const reason = event.reason;
     // new/resume/fork reuse the running extension instance (getExtensions() is
@@ -1142,14 +1153,15 @@ Set up task dependencies:
 - Use block=true (default) to wait for task completion
 - Use block=false for non-blocking check of current status
 - Task IDs can be found using the /tasks command
-- Works with all task types: background shells, async agents, and remote sessions`,
+- Works with all task types: background shells, async agents, and remote sessions
+- Also accepts background job IDs (job-…) when the pi-background-jobs extension is loaded`,
     parameters: Type.Object({
       task_id: Type.String({ description: "The task ID to get output from" }),
       block: Type.Boolean({ description: "Whether to wait for completion", default: true }),
       timeout: Type.Number({ description: "Max wait time in ms", default: 30000, minimum: 0, maximum: 600000 }),
     }),
 
-    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const { task_id, block, timeout } = params;
       // Reject an empty id up front: every agent ID starts with "", so the prefix
       // match below would resolve it to whichever agent the map yields first.
@@ -1157,6 +1169,18 @@ Set up task dependencies:
 
       const processOutput = tracker.getOutput(task_id);
       if (!processOutput) {
+        // A job id belongs to the pi-background-jobs extension, which owns its
+        // store: read it there before the task lookup, and never through the task
+        // store — a job exiting is not a task changing state. The wait budget is
+        // TaskOutput's own, in milliseconds.
+        if (JOB_ID.test(task_id)) {
+          const jobOutput = await jobsRpc.jobOutput(
+            { cwd: ctx.cwd, jobId: task_id, block: block ?? true, timeoutMs: timeout ?? 30000 },
+            signal ?? undefined,
+          );
+          return textResult(formatJobOutput(jobOutput));
+        }
+
         // No shell process — check if this is a subagent task
         // Support both task IDs and agent IDs (resolve agent ID → task ID)
         let resolvedId = task_id;
@@ -1234,18 +1258,27 @@ Set up task dependencies:
 - Stops a running background task by its ID
 - Takes a task_id parameter identifying the task to stop
 - Returns a success or failure status
-- Use this tool when you need to terminate a long-running task`,
+- Use this tool when you need to terminate a long-running task
+- Also accepts background job IDs (job-…) when the pi-background-jobs extension is loaded`,
     parameters: Type.Object({
       task_id: Type.Optional(Type.String({ description: "The ID of the background task to stop" })),
       shell_id: Type.Optional(Type.String({ description: "Deprecated: use task_id instead" })),
     }),
 
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const taskId = params.task_id ?? params.shell_id;
       if (!taskId) throw new Error("task_id is required");
 
       const stopped = await tracker.stop(taskId);
       if (!stopped) {
+        // A job is not a task: stop it through its own extension and leave the
+        // task store (and widget) untouched. The helper reports only a confirmed
+        // termination; anything else propagates as an error.
+        if (JOB_ID.test(taskId)) {
+          const result = await jobsRpc.jobStop(ctx.cwd, taskId, signal ?? undefined);
+          return textResult(formatJobStop(result));
+        }
+
         // No shell process — check if this is a subagent task
         // Support both task IDs and agent IDs
         let resolvedId = taskId;
@@ -1413,11 +1446,20 @@ Set up task dependencies:
         const hiddenCount = tasks.length - visible.length;
         const completedVisible = visible.filter(task => task.status === "completed").length;
         const groups = store.listGroups();
-        const choices = [
-          `View all tasks (${visible.length})`,
-          "Create task",
-          "Create task group",
-        ];
+        let jobCount: number | undefined;
+        if (jobsRpc.available) {
+          try {
+            if (await jobsRpc.checkBackgroundJobs()) {
+              const jobs = await jobsRpc.jobList(ctx.cwd, "running");
+              jobCount = jobs.filter(job => job.isBackground).length;
+            }
+          } catch (error) {
+            ui.notify(`Could not load background jobs: ${error instanceof Error ? error.message : String(error)}. Run /jobs directly.`, "warning");
+          }
+        }
+        const choices = [`View all tasks (${visible.length})`];
+        if (jobCount !== undefined) choices.push(`Jobs (${jobCount})`);
+        choices.push("Create task", "Create task group");
         if (groups.length > 0) choices.push(`Manage task groups (${groups.length})`);
         if (hiddenCount > 0) choices.push(`Show history (${hiddenCount})`);
         if (completedVisible > 0) choices.push(`Hide completed (${completedVisible})`);
@@ -1427,6 +1469,15 @@ Set up task dependencies:
         const choice = await ui.select("Tasks", choices);
         if (!choice) return;
         if (choice.startsWith("View")) return viewTasks(false);
+        if (choice.startsWith("Jobs (")) {
+          try {
+            const opened = await jobsRpc.openJobs(ctx.cwd);
+            if (!opened) ui.notify("The jobs overlay could not open here. Run /jobs directly.", "warning");
+          } catch (error) {
+            ui.notify(`Could not open the jobs overlay: ${error instanceof Error ? error.message : String(error)}. Run /jobs directly.`, "warning");
+          }
+          return;
+        }
         if (choice === "Create task") return createTask();
         if (choice === "Create task group") return createGroup();
         if (choice.startsWith("Manage task groups")) return manageGroups();

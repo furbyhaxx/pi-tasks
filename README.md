@@ -22,6 +22,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
 - **Subagent integration** — tasks with `agentType` can be executed as subagents via `TaskExecute` (requires [@tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents)). Auto-cascade mode flows through the task DAG automatically when enabled.
+- **Background job routing** — `TaskOutput` and `TaskStop` accept `job-…` ids from the optional [@furbyhaxx/pi-background-jobs](https://github.com/furbyhaxx/pi-background-jobs) extension and delegate to it. Jobs are not tasks: stopping or reading one never changes task state or dependencies.
 
 ## Install
 
@@ -195,11 +196,15 @@ Retrieve output from a background task process.
 
 Both task IDs and agent IDs (including partial prefixes) are accepted — agent IDs are resolved via the internal `agentTaskMap`.
 
+A `job-…` id is delegated to [pi-background-jobs](#background-jobs-with-furbyhaxxpi-background-jobs) instead: the job's status, intent, bounded output tail, and full output path come back, with the tool's `timeout` (milliseconds) used as the job's wait budget. A job exit never reports on a task. Without the extension, a job-shaped id fails with `Background jobs extension is not loaded`.
+
 For a subagent task that has finished, the tool returns the agent's stored result (or its error) under the status line, so joining a task and reading what it produced is one call. Doing so also [consumes the result](#joining-a-subagent).
 
 ### `TaskStop`
 
 Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC.
+
+A `job-…` id is delegated to [pi-background-jobs](#background-jobs-with-furbyhaxxpi-background-jobs): it reports only a confirmed termination, calls nothing in the task store, and propagates the extension's errors (an already-finished job, an unknown id).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -329,6 +334,7 @@ Interactive menu:
 ```
 Tasks
 ├─ View all tasks (4)
+├─ Jobs (2)                # when pi-background-jobs is loaded
 ├─ Create task
 ├─ Create task group
 ├─ Manage task groups (2)
@@ -339,6 +345,7 @@ Tasks
 ```
 
 - **View all tasks** — select visible work to start, complete, hide, move, ungroup, or permanently delete
+- **Jobs** — open the companion extension's existing `/jobs` overlay; shown only when that extension is available, with the active background-job count
 - **Create task / task group** — create leaf work or an ordered planning phase
 - **Manage task groups** — rename groups, edit prerequisites, or remove a container without deleting its tasks
 - **Show history / Hide completed** — inspect, restore, or retire completed work without data loss
@@ -409,6 +416,22 @@ Fire-and-forget, and deliberately outside the version handshake — a [`pi-subag
 
 If [`pi-subagents`](https://github.com/tintinweb/pi-subagents) is not installed, everything works except `TaskExecute`, which returns a friendly message explaining the agent can fall back to plain Agent-tool spawns — with the caveat that pi-tasks won't track those (status stays `pending`, auto-cascade won't fire, `TaskOutput` stays empty). All core task tools (create, list, get, update, dependencies, widget, system-reminder injection) function independently.
 
+### Background Jobs with [`@furbyhaxx/pi-background-jobs`](https://github.com/furbyhaxx/pi-background-jobs)
+
+The optional [`@furbyhaxx/pi-background-jobs`](https://github.com/furbyhaxx/pi-background-jobs) extension owns `bash` background jobs and their `job-…` ids. When it is available, `/tasks` shows `Jobs (N)` and opens the extension's existing `/jobs` overlay rather than creating a second manager. `TaskOutput` and `TaskStop` recognize job ids and delegate to it over the same events RPC — a job is not a task, so the job branch reads or stops the job and returns without touching the task store. Job statuses include `starting`, `running`, `exited`, `stopped`, `output-cap`, `failed`, and `lost`; there is no execution-timeout status, because a `bash` timeout is a foreground wait budget that promotes the command, not a job outcome.
+
+The handshake mirrors pi-subagents: a `ping` at `session_start`, plus a `background-jobs:ready` broadcast when the extension has bound its handlers, so load order does not matter. A missed handshake is re-probed on the next call rather than cached as unavailable. Requests carry a caller-supplied `cwd` — the worktree of the calling session — and `output.timeoutMs` is in milliseconds; `TaskOutput` passes its own `timeout` through unchanged.
+
+| Channel | Params | Reply data |
+|---------|--------|------------|
+| `background-jobs:rpc:ping` | — | `{ version: 1 }` |
+| `background-jobs:rpc:list` | `{ cwd, status? }` | job summaries |
+| `background-jobs:rpc:output` | `{ cwd, jobId, block?, timeoutMs?, tailLines? }` | job output with status, `outputPath`, and a bounded tail |
+| `background-jobs:rpc:stop` | `{ cwd, jobId }` | `{ id, intent, status }` |
+| `background-jobs:rpc:open` | `{ cwd }` | `{ opened }` — opens the extension's own `/jobs` view when a UI can accept it |
+
+Replies use the same envelope on `<channel>:reply:<requestId>`. Without the extension, a job-shaped id fails with `Background jobs extension is not loaded`; ids that do not match `job-` plus 8 lowercase hex digits always take the task/agent path.
+
 ## Architecture
 
 ```
@@ -423,6 +446,7 @@ src/
 ├── task-sort.ts        # Widget ordering: sort presets and sort specs
 ├── reminder-cadence.ts # Pure cadence logic for system-reminder injection
 ├── process-tracker.ts  # Background process output buffering and stop
+├── background-jobs-rpc.ts # Optional pi-background-jobs RPC client for job-id routing
 └── ui/
     ├── task-widget.ts  # Persistent widget with status glyphs and spinner
     └── settings-menu.ts  # /tasks → Settings panel (SettingsList TUI component)

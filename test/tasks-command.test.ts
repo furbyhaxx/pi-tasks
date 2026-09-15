@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import initExtension from "../src/index.js";
 import { TaskStore } from "../src/task-store.js";
-import { mockPi } from "./helpers/mock-pi.js";
+import { flush, installBackgroundJobsMock, mockPi } from "./helpers/mock-pi.js";
 
 const config = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("../src/tasks-config.js", () => ({
@@ -109,6 +109,44 @@ describe("/tasks main menu", () => {
     expect(customCalls).toHaveLength(1);
     expect(selects).toHaveLength(2);
     expect(selects[1].title).toBe("Tasks");
+  });
+
+  it("opens Jobs without recursively reopening a selector over its overlay", async () => {
+    let requests: ReturnType<typeof installBackgroundJobsMock>["requests"] | undefined;
+    const { selects } = await runTasks(["Jobs (1)"], async mock => {
+      const jobs = installBackgroundJobsMock(mock.pi, {
+        jobs: [
+          { id: "job-00000001", status: "running", isBackground: true },
+          { id: "job-00000002", status: "running", isBackground: false },
+        ],
+      });
+      requests = jobs.requests;
+      jobs.ready();
+      await flush();
+    });
+
+    expect(selects[0]?.choices).toContain("Jobs (1)");
+    expect(selects).toHaveLength(1);
+    expect(requests?.open).toHaveLength(1);
+  });
+
+  it("keeps the jobs entry hidden when the companion is absent", async () => {
+    const { selects } = await runTasks([undefined], async () => {});
+    expect(selects[0]?.choices.some(choice => choice.startsWith("Jobs ("))).toBe(false);
+  });
+
+  it("points to /jobs and returns when the companion cannot accept an overlay", async () => {
+    const { ui, selects } = await runTasks(["Jobs (0)"], async mock => {
+      const jobs = installBackgroundJobsMock(mock.pi, { open: false });
+      jobs.ready();
+      await flush();
+    });
+
+    expect(ui.notify).toHaveBeenCalledWith(
+      "The jobs overlay could not open here. Run /jobs directly.",
+      "warning",
+    );
+    expect(selects).toHaveLength(1);
   });
 });
 

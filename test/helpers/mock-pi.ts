@@ -4,6 +4,7 @@
  */
 
 import { vi } from "vitest";
+import type { JobOutput, JobStopResult, JobSummary } from "../../src/background-jobs-rpc.js";
 
 export type MockEventBus = {
   on: (channel: string, handler: (data: unknown) => void) => () => void;
@@ -208,5 +209,135 @@ export function installSubagentsMock(
     /** Wait past the notification hold, so `notified` is final. */
     afterNudgeHold() { return new Promise<void>(resolve => setTimeout(resolve, NUDGE_HOLD_MS * 2)); },
     unsub() { unsubPing(); unsubSpawn(); unsubStop(); unsubConsume(); },
+  };
+}
+
+/**
+ * Simulates the @furbyhaxx/pi-background-jobs extension on the same event bus:
+ * answers the ping with protocol version 1, replies to list/output/stop/open with
+ * the plan's JobOutput envelope, and can announce readiness. Requests are recorded
+ * so tests can assert the exact payload pi-tasks sent.
+ *
+ * The options object is read per request, so a test can change a reply mid-test
+ * (for example `opts.stop = { status: "running" }` to model an unconfirmed stop).
+ */
+export interface BackgroundJobsMockOptions {
+  /** Protocol version reported by ping (default 1). */
+  version?: number;
+  /** Job summaries returned by `list`; also the base for `output`/`stop` replies. */
+  jobs?: Array<Partial<JobSummary> & { id: string }>;
+  /** Overrides merged into each `output` reply. */
+  output?: Partial<JobOutput>;
+  /** Overrides merged into each `stop` reply. */
+  stop?: Partial<JobStopResult>;
+  /** Reply to `stop` with this error instead of data. */
+  stopError?: string;
+  /** `opened` value returned by `open` (default true). */
+  open?: boolean;
+  /** Raw `open` response data for malformed-boundary tests. */
+  openData?: unknown;
+}
+
+interface BackgroundJobsRequest {
+  requestId: string;
+  [key: string]: unknown;
+}
+
+export function installBackgroundJobsMock(pi: { events: MockEventBus }, opts: BackgroundJobsMockOptions = {}) {
+  const requests: {
+    ping: BackgroundJobsRequest[];
+    list: BackgroundJobsRequest[];
+    output: BackgroundJobsRequest[];
+    stop: BackgroundJobsRequest[];
+    open: BackgroundJobsRequest[];
+  } = { ping: [], list: [], output: [], stop: [], open: [] };
+  const unsubs: Array<() => void> = [];
+  /** Gate for the next `output` reply, set by holdNextOutput(). */
+  let outputGate: Promise<void> | undefined;
+
+  function reply(channel: string, requestId: string, envelope: { success: true; data: unknown } | { success: false; error: string }) {
+    pi.events.emit(`${channel}:reply:${requestId}`, envelope);
+  }
+
+  function summary(id: string, overrides?: Partial<JobSummary>): JobSummary {
+    const base: JobSummary = {
+      id,
+      intent: "run tests",
+      command: "npm test",
+      cwd: process.cwd(),
+      worktree: process.cwd(),
+      status: "exited",
+      createdAt: 1,
+      endedAt: 2,
+      exitCode: 0,
+      creator: { pid: 1, sessionId: "session-1" },
+      outputPath: `/jobs/${id}/output.log`,
+      promoted: false,
+      isBackground: false,
+    };
+    return { ...base, ...overrides };
+  }
+
+  unsubs.push(pi.events.on("background-jobs:rpc:ping", (data: unknown) => {
+    const request = data as BackgroundJobsRequest;
+    requests.ping.push(request);
+    reply("background-jobs:rpc:ping", request.requestId, { success: true, data: { version: opts.version ?? 1 } });
+  }));
+
+  unsubs.push(pi.events.on("background-jobs:rpc:list", (data: unknown) => {
+    const request = data as BackgroundJobsRequest;
+    requests.list.push(request);
+    reply("background-jobs:rpc:list", request.requestId, {
+      success: true,
+      data: (opts.jobs ?? []).map(job => summary(job.id, job)),
+    });
+  }));
+
+  unsubs.push(pi.events.on("background-jobs:rpc:output", async (data: unknown) => {
+    const request = data as BackgroundJobsRequest;
+    requests.output.push(request);
+    const gate = outputGate;
+    outputGate = undefined;
+    if (gate) await gate;
+    const output: JobOutput = {
+      ...summary(String(request.jobId)),
+      output: "all tests passed\n",
+      truncated: false,
+      retrieval: "complete",
+      ...opts.output,
+    };
+    reply("background-jobs:rpc:output", request.requestId, { success: true, data: output });
+  }));
+
+  unsubs.push(pi.events.on("background-jobs:rpc:stop", (data: unknown) => {
+    const request = data as BackgroundJobsRequest;
+    requests.stop.push(request);
+    if (opts.stopError) {
+      reply("background-jobs:rpc:stop", request.requestId, { success: false, error: opts.stopError });
+      return;
+    }
+    const result: JobStopResult = {
+      id: String(request.jobId),
+      intent: "run tests",
+      status: "stopped",
+      ...opts.stop,
+    };
+    reply("background-jobs:rpc:stop", request.requestId, { success: true, data: result });
+  }));
+
+  unsubs.push(pi.events.on("background-jobs:rpc:open", (data: unknown) => {
+    const request = data as BackgroundJobsRequest;
+    requests.open.push(request);
+    const response = "openData" in opts ? opts.openData : { opened: opts.open ?? true };
+    reply("background-jobs:rpc:open", request.requestId, { success: true, data: response });
+  }));
+
+  return {
+    requests,
+    /** Hold the next output reply until `gate` resolves. */
+    holdNextOutput(gate: Promise<void>) { outputGate = gate; },
+    /** Announce that the extension registered its handlers. */
+    ready() { pi.events.emit("background-jobs:ready", {}); },
+    unsub() { for (const unsub of unsubs) unsub(); },
   };
 }
