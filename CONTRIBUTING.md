@@ -56,9 +56,12 @@ Other guidelines:
 
 - Keep PRs focused — one logical change per PR. Unrelated refactors make review
   harder and are likely to be split out or declined.
+- Create granular, conventional commits while you work. Each commit should contain
+  one coherent change and pass its relevant checks.
 - Add or update tests for behavior you change.
 - Match the surrounding code style (enforced by biome).
-- Do not edit `CHANGELOG.md`. Changelog entries are added by the maintainer.
+- After a branch or isolated worktree is merged back into the canonical worktree,
+  update `CHANGELOG.md` there and commit the changelog separately.
 - Update the README when you add or change user-facing behavior.
 
 ## Questions?

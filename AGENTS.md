@@ -56,10 +56,11 @@ range changes.
 
 ## Git
 
-- **Never commit.** The user commits manually. At most, suggest a concise commit message as text.
+- Always create granular, conventional commits while you work. Each commit must contain one coherent change and pass its relevant checks.
+- When work is done in a branch or isolated worktree, merge it back into the canonical worktree before updating `CHANGELOG.md`; commit the changelog update after the merge.
 - **Never push**, tag, or create branches unless the user explicitly asks.
 - Never run history- or worktree-destroying commands: `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, `git add -A`, `git add .`, `git commit --no-verify`, or any force push.
-- Leave the working tree as the user left it — don't stage, stash, or revert files you didn't change.
+- Stage only files belonging to the current logical change. Do not stage, stash, revert, or commit unrelated changes.
 
 ## Issues and PRs
 
@@ -80,6 +81,7 @@ When posting issue/PR comments:
 
 Location: `CHANGELOG.md` (single file, [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format).
 
+- Update the changelog only after the implementation branch or isolated worktree has been merged back into the canonical worktree, then commit that update separately.
 - All new entries go under `## [Unreleased]`, in the right subsection (`### Added`, `### Changed`, `### Fixed`, `### Removed`, `### Security`, `### Refactored`). Read the section first and append to existing subsections; never duplicate them.
 - One bullet per issue/PR. Never combine separate issues or pull requests into a single entry, even when they touch the same or similar components. (A PR together with the issue it closes or that diagnosed it is one change — one bullet citing both.)
 - Breaking changes are not a separate subsection. Call them out with a `> **⚠️ Breaking: …**` blockquote at the top of the version section, and/or a bold `**BREAKING:**` bullet under `### Changed`, with a migration note.
