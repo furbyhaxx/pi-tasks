@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-17
+
 ### Fixed
 
 - **Opening Jobs from `/tasks` no longer leaves a hidden task selector over the Jobs overlay.** The menu returns immediately after the background-jobs RPC accepts the open, including warning paths.
