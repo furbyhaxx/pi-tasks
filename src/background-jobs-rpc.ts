@@ -218,13 +218,19 @@ function isOpenResult(value: unknown): value is { opened: boolean } {
 /** Model-facing text for a delegated `TaskOutput` call: status/intent, the full
  *  output path, and the output bounded from the tail (2000 lines / 50 KiB) so a
  *  runaway log cannot be pulled into the transcript. */
-export function formatJobOutput(output: JobOutput): string {
+export function formatJobOutputParts(output: JobOutput): { header: string; body: string; text: string } {
   const status = `${output.id} [${output.status}${output.exitCode !== undefined && output.exitCode !== null ? `, exit ${output.exitCode}` : ""}]`;
   const truncation = truncateTail(output.output ?? "");
   const notice = output.truncated || truncation.truncated
     ? `\n\n[Output truncated. Full output: ${output.outputPath}]`
     : "";
-  return `Job ${status} ${output.intent}\nOutput file: ${output.outputPath}\n\n${truncation.content}${notice}`;
+  const header = `Job ${status} ${output.intent}\nOutput file: ${output.outputPath}`;
+  const body = `${truncation.content}${notice}`;
+  return { header, body, text: `${header}\n\n${body}` };
+}
+
+export function formatJobOutput(output: JobOutput): string {
+  return formatJobOutputParts(output).text;
 }
 
 /** Model-facing text for a delegated `TaskStop` call. Only an actual termination

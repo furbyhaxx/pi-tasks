@@ -13,6 +13,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 ## Features
 
 - **9 LLM-callable tools** — the seven Claude Code-style task tools plus `TaskGroupCreate` and `TaskGroupUpdate` for ordered work phases
+- **Native tool transcripts** — compact self-rendered calls, truthful pending/error states, semantic task statuses, and expandable result previews using the same visual grammar as pi-background-jobs
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status marks, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts. Every glyph is [configurable](CUSTOMIZING.md#task-glyphs)
 - **System-reminder injection** — periodic `<system-reminder>` nudges injected into the upcoming LLM request (via the `context` hook, transient and never persisted) when task tools haven't been used recently, or when a task is left stuck `in_progress` after a text-only turn. Shaped after Claude Code's todo reminders — an empty-list nudge or a JSON echo of the current list (capped at 10 tasks)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
@@ -25,6 +26,8 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Background job routing** — `TaskOutput` and `TaskStop` accept `job-…` ids from the optional [@furbyhaxx/pi-background-jobs](https://github.com/furbyhaxx/pi-background-jobs) extension and delegate to it. Jobs are not tasks: stopping or reading one never changes task state or dependencies.
 
 ## Install
+
+Requires pi 0.85.1 or newer.
 
 ```bash
 pi install npm:@tintinweb/pi-tasks
@@ -447,8 +450,11 @@ src/
 ├── reminder-cadence.ts # Pure cadence logic for system-reminder injection
 ├── process-tracker.ts  # Background process output buffering and stop
 ├── background-jobs-rpc.ts # Optional pi-background-jobs RPC client for job-id routing
+├── tools/
+│   └── task-details.ts # Versioned, bounded transcript result details
 └── ui/
     ├── task-widget.ts  # Persistent widget with status glyphs and spinner
+    ├── tool-transcript.ts # Self-rendered call/result transcript components
     └── settings-menu.ts  # /tasks → Settings panel (SettingsList TUI component)
 ```
 

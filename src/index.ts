@@ -17,10 +17,18 @@
 
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type Theme,
+  truncateHead,
+  truncateLine,
+  truncateTail,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { AutoClearManager } from "./auto-clear.js";
-import { createBackgroundJobsRpc, formatJobOutput, formatJobStop, JOB_ID } from "./background-jobs-rpc.js";
+import { createBackgroundJobsRpc, formatJobOutputParts, formatJobStop, JOB_ID } from "./background-jobs-rpc.js";
 import { ProcessTracker } from "./process-tracker.js";
 import {
   type CadenceConfig,
@@ -34,9 +42,11 @@ import { resolveTaskGlyphs } from "./task-glyphs.js";
 import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { orderTaskGroups, TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
+import type { TaskToolName } from "./tools/task-details.js";
 import type { Task, TaskGroup } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
+import { renderTaskToolCall, renderTaskToolResult } from "./ui/tool-transcript.js";
 
 // ---- Debug ----
 
@@ -47,8 +57,57 @@ function debug(...args: unknown[]) {
 
 // ---- Helpers ----
 
-function textResult(msg: string) {
-  return { content: [{ type: "text" as const, text: msg }], details: undefined as any };
+function textResult(tool: TaskToolName, msg: string) {
+  const snapshot = truncateHead(msg);
+  const text = snapshot.firstLineExceedsLimit
+    ? truncateLine(msg.split("\n", 1)[0] ?? "", 500).text
+    : snapshot.content;
+  return {
+    content: [{ type: "text" as const, text: msg }],
+    details: {
+      version: 1 as const,
+      tool,
+      capturedAt: Date.now(),
+      text,
+      truncated: snapshot.truncated,
+    },
+  };
+}
+
+function taskOutputResult(headerText: string, bodyText = "") {
+  const header = truncateHead(headerText, { maxLines: 10, maxBytes: 4 * 1024 });
+  const body = truncateTail(bodyText, { maxLines: 2_000, maxBytes: 47_000 });
+  const text = body.content ? `${header.content}\n\n${body.content}` : header.content;
+  const msg = bodyText ? `${headerText}\n\n${bodyText}` : headerText;
+  return {
+    content: [{ type: "text" as const, text: msg }],
+    details: {
+      version: 1 as const,
+      tool: "TaskOutput" as const,
+      capturedAt: Date.now(),
+      text,
+      truncated: header.truncated || body.truncated,
+      headerText: header.content,
+      bodyText: body.content,
+    },
+  };
+}
+
+function taskToolRenderers(tool: TaskToolName) {
+  return {
+    renderShell: "self" as const,
+    renderCall(args: Record<string, unknown>, theme: Theme, context: Parameters<typeof renderTaskToolCall>[3]) {
+      return renderTaskToolCall(tool, args, theme, context);
+    },
+    renderResult(
+      result: Parameters<typeof renderTaskToolResult>[1],
+      options: Parameters<typeof renderTaskToolResult>[2],
+      theme: Theme,
+      context: Parameters<typeof renderTaskToolResult>[4],
+    ) {
+      return renderTaskToolResult(tool, result, options, theme, context);
+    },
+  };
 }
 
 /** Task tool names — used to detect task tool usage for reminder suppression. */
@@ -668,6 +727,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "TaskGroupCreate",
     label: "TaskGroupCreate",
+    ...taskToolRenderers("TaskGroupCreate"),
     description: `Create a non-executable task group. Groups organize tasks and may depend on other groups. If group B is blocked by group A, no task in B can start until every task in A is completed. Empty prerequisite groups remain blocking.`,
     promptGuidelines: [
       "Use TaskGroupCreate when a plan needs ordered phases; use task dependencies for partial hand-offs between individual tasks.",
@@ -680,13 +740,14 @@ export default function (pi: ExtensionAPI) {
     execute(_toolCallId, params) {
       const group = store.createGroup(params.subject, params.description, params.blockedBy);
       widget.update();
-      return Promise.resolve(textResult(`Task group ${group.id} created successfully: ${group.subject}`));
+      return Promise.resolve(textResult("TaskGroupCreate", `Task group ${group.id} created successfully: ${group.subject}`));
     },
   });
 
   pi.registerTool({
     name: "TaskGroupUpdate",
     label: "TaskGroupUpdate",
+    ...taskToolRenderers("TaskGroupUpdate"),
     description: `Update or delete a task group. Group dependency changes are validated for cycles. Deleting a group ungroups its tasks and is rejected while another group depends on it; it never deletes tasks.`,
     parameters: Type.Object({
       groupId: Type.String({ description: "Task-group ID" }),
@@ -705,9 +766,9 @@ export default function (pi: ExtensionAPI) {
           || params.addBlockedBy !== undefined || params.removeBlockedBy !== undefined) {
           throw new Error("Delete cannot be combined with group update fields");
         }
-        if (!store.deleteGroup(params.groupId)) return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+        if (!store.deleteGroup(params.groupId)) return Promise.resolve(textResult("TaskGroupUpdate", `Task group ${params.groupId} not found`));
         widget.update();
-        return Promise.resolve(textResult(`Deleted task group ${params.groupId}; its tasks are now ungrouped`));
+        return Promise.resolve(textResult("TaskGroupUpdate", `Deleted task group ${params.groupId}; its tasks are now ungrouped`));
       }
       const group = store.updateGroup(params.groupId, {
         subject: params.subject,
@@ -715,9 +776,9 @@ export default function (pi: ExtensionAPI) {
         addBlockedBy: params.addBlockedBy,
         removeBlockedBy: params.removeBlockedBy,
       });
-      if (!group) return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+      if (!group) return Promise.resolve(textResult("TaskGroupUpdate", `Task group ${params.groupId} not found`));
       widget.update();
-      return Promise.resolve(textResult(`Updated task group ${group.id}: ${group.subject}`));
+      return Promise.resolve(textResult("TaskGroupUpdate", `Updated task group ${group.id}: ${group.subject}`));
     },
   });
 
@@ -728,6 +789,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "TaskCreate",
     label: "TaskCreate",
+    ...taskToolRenderers("TaskCreate"),
     description: `Use TaskCreate to turn work you are about to do into executable units: one useful outcome each, bounded in scope, carrying enough context to be picked up by a fresh agent, and finished against stated acceptance criteria.
 
 ## When to Use This Tool
@@ -818,7 +880,7 @@ TaskCreate {"subject": "Rewire CLI onto both modules", "blockedBy": ["1", "2"], 
         params.blockedBy,
       );
       widget.update();
-      return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
+      return Promise.resolve(textResult("TaskCreate", `Task #${task.id} created successfully: ${task.subject}`));
     },
   });
 
@@ -829,6 +891,7 @@ TaskCreate {"subject": "Rewire CLI onto both modules", "blockedBy": ["1", "2"], 
   pi.registerTool({
     name: "TaskList",
     label: "TaskList",
+    ...taskToolRenderers("TaskList"),
     description: `Use this tool to list visible tasks and task groups. Pass includeHidden=true to inspect retained completed history.
 
 ## When to Use This Tool
@@ -867,7 +930,7 @@ Use TaskGet with a specific task ID to view full details including description a
       const allTasks = store.list();
       const groups = orderTaskGroups(store.listGroups());
       if (params.groupId !== undefined && params.groupId !== null && !store.getGroup(params.groupId)) {
-        return Promise.resolve(textResult(`Task group ${params.groupId} not found`));
+        return Promise.resolve(textResult("TaskList", `Task group ${params.groupId} not found`));
       }
       const scopedTasks = params.groupId === undefined
         ? allTasks
@@ -927,7 +990,7 @@ Use TaskGet with a specific task ID to view full details including description a
       if (!params.includeHidden && hiddenCount > 0) {
         lines.push(`${hiddenCount} hidden completed task${hiddenCount === 1 ? "" : "s"} — use includeHidden: true to view history`);
       }
-      return Promise.resolve(textResult(lines.join("\n")));
+      return Promise.resolve(textResult("TaskList", lines.join("\n")));
     },
   });
 
@@ -938,6 +1001,7 @@ Use TaskGet with a specific task ID to view full details including description a
   pi.registerTool({
     name: "TaskGet",
     label: "TaskGet",
+    ...taskToolRenderers("TaskGet"),
     description: `Use this tool to retrieve a task by its ID from the task list.
 
 ## When to Use This Tool
@@ -966,7 +1030,7 @@ Returns full task details:
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const task = store.get(params.taskId);
-      if (!task) return Promise.resolve(textResult(`Task not found`));
+      if (!task) return Promise.resolve(textResult("TaskGet", "Task not found"));
 
       // Unescape literal \n sequences the LLM may have double-escaped in JSON
       const desc = task.description.replace(/\\n/g, "\n");
@@ -997,7 +1061,7 @@ Returns full task details:
         lines.push(`Metadata: ${JSON.stringify(task.metadata)}`);
       }
 
-      return Promise.resolve(textResult(lines.join("\n")));
+      return Promise.resolve(textResult("TaskGet", lines.join("\n")));
     },
   });
 
@@ -1008,6 +1072,7 @@ Returns full task details:
   pi.registerTool({
     name: "TaskUpdate",
     label: "TaskUpdate",
+    ...taskToolRenderers("TaskUpdate"),
     description: `Use this tool to update a task in the task list.
 
 ## When to Use This Tool
@@ -1113,7 +1178,7 @@ Set up task dependencies:
       const { task, changedFields, warnings } = store.update(taskId, fields);
 
       if (changedFields.length === 0 && !task) {
-        return Promise.resolve(textResult(`Task #${taskId} not found`));
+        return Promise.resolve(textResult("TaskUpdate", `Task #${taskId} not found`));
       }
 
       // Update widget active task tracking
@@ -1136,7 +1201,7 @@ Set up task dependencies:
       if (warnings.length > 0) {
         msg += ` (warning: ${warnings.join("; ")})`;
       }
-      return Promise.resolve(textResult(msg));
+      return Promise.resolve(textResult("TaskUpdate", msg));
     },
   });
 
@@ -1147,6 +1212,7 @@ Set up task dependencies:
   pi.registerTool({
     name: "TaskOutput",
     label: "TaskOutput",
+    ...taskToolRenderers("TaskOutput"),
     description: `- Retrieves output from a running or completed task (background shell, agent, or remote session)
 - Takes a task_id parameter identifying the task
 - Returns the task output along with status information
@@ -1178,7 +1244,8 @@ Set up task dependencies:
             { cwd: ctx.cwd, jobId: task_id, block: block ?? true, timeoutMs: timeout ?? 30000 },
             signal ?? undefined,
           );
-          return textResult(formatJobOutput(jobOutput));
+          const formatted = formatJobOutputParts(jobOutput);
+          return taskOutputResult(formatted.header, formatted.body);
         }
 
         // No shell process — check if this is a subagent task
@@ -1223,10 +1290,16 @@ Set up task dependencies:
           // getting a status, and the notification pi-subagents is holding is the
           // only thing that will announce the result.
           if (!agentTaskMap.has(agentId) && updated.status !== "in_progress") consumeSubagentResult(agentId);
-          const output = updated.metadata?.result
+          const rawOutput = updated.metadata?.result
             ?? (updated.metadata?.lastError ? `Error: ${updated.metadata.lastError}` : undefined);
-          return textResult(
-            `Task #${resolvedId} [${updated.status}] — subagent ${agentId}${output ? `\n\n${output}` : ""}`,
+          const output = typeof rawOutput === "string"
+            ? rawOutput
+            : rawOutput === undefined
+              ? undefined
+              : JSON.stringify(rawOutput);
+          return taskOutputResult(
+            `Task #${resolvedId} [${updated.status}] — subagent ${agentId}`,
+            output,
           );
         }
         throw new Error(`No background process for task ${task_id}`);
@@ -1235,14 +1308,16 @@ Set up task dependencies:
       if (block && processOutput.status === "running") {
         const result = await tracker.waitForCompletion(task_id, timeout ?? 30000, signal ?? undefined);
         if (result) {
-          return textResult(
-            `Task #${task_id} (${result.status})${result.exitCode !== undefined ? ` exit code: ${result.exitCode}` : ""}\n\n${result.output}`,
+          return taskOutputResult(
+            `Task #${task_id} (${result.status})${result.exitCode !== undefined ? ` exit code: ${result.exitCode}` : ""}`,
+            result.output,
           );
         }
       }
 
-      return textResult(
-        `Task #${task_id} (${processOutput.status})${processOutput.exitCode !== undefined ? ` exit code: ${processOutput.exitCode}` : ""}\n\n${processOutput.output}`,
+      return taskOutputResult(
+        `Task #${task_id} (${processOutput.status})${processOutput.exitCode !== undefined ? ` exit code: ${processOutput.exitCode}` : ""}`,
+        processOutput.output,
       );
     },
   });
@@ -1254,6 +1329,7 @@ Set up task dependencies:
   pi.registerTool({
     name: "TaskStop",
     label: "TaskStop",
+    ...taskToolRenderers("TaskStop"),
     description: `
 - Stops a running background task by its ID
 - Takes a task_id parameter identifying the task to stop
@@ -1276,7 +1352,7 @@ Set up task dependencies:
         // termination; anything else propagates as an error.
         if (JOB_ID.test(taskId)) {
           const result = await jobsRpc.jobStop(ctx.cwd, taskId, signal ?? undefined);
-          return textResult(formatJobStop(result));
+          return textResult("TaskStop", formatJobStop(result));
         }
 
         // No shell process — check if this is a subagent task
@@ -1296,7 +1372,7 @@ Set up task dependencies:
           await stopSubagent(task.metadata.agentId);
           widget.setActiveTask(resolvedId, false);
           widget.update();
-          return textResult(`Task #${resolvedId} stopped successfully`);
+          return textResult("TaskStop", `Task #${resolvedId} stopped successfully`);
         }
         throw new Error(`No running background process for task ${taskId}`);
       }
@@ -1307,7 +1383,7 @@ Set up task dependencies:
       autoClear.trackCompletion(taskId, cadence.currentTurn);
       widget.setActiveTask(taskId, false);
       widget.update();
-      return textResult(`Task #${taskId} stopped successfully`);
+      return textResult("TaskStop", `Task #${taskId} stopped successfully`);
     },
   });
 
@@ -1318,6 +1394,7 @@ Set up task dependencies:
   pi.registerTool({
     name: "TaskExecute",
     label: "TaskExecute",
+    ...taskToolRenderers("TaskExecute"),
     description: `Execute one or more tasks as subagents.
 
 ## When to Use This Tool
@@ -1354,6 +1431,7 @@ Set up task dependencies:
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (!subagentsAvailable) {
         return textResult(
+          "TaskExecute",
           "Subagent execution is currently unavailable (@tintinweb/pi-subagents not loaded " +
           "or version mismatch). You can run these as plain Agent-tool spawns, but pi-tasks " +
           "won't track them — status stays pending, cascade won't fire, TaskOutput stays empty."
@@ -1416,7 +1494,7 @@ Set up task dependencies:
       if (results.length > 0) lines.push(`Skipped:\n${results.join("\n")}`);
       if (lines.length === 0) lines.push("No tasks to execute.");
 
-      return textResult(lines.join("\n\n"));
+      return textResult("TaskExecute", lines.join("\n\n"));
     },
   });
 

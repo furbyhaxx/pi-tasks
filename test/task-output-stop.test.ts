@@ -42,8 +42,18 @@ describe("TaskOutput", () => {
     expect(res.content[0].text).toBe("Task #1 [in_progress] — subagent agent-1");
   });
 
-  it("resolves a blocking wait when the agent completes", async () => {
+  it("serializes non-string metadata results", async () => {
     await launchAgentTask(mock);
+    await mock.executeTool("TaskUpdate", { taskId: "1", metadata: { result: { summary: "done" } } });
+    const objectResult = await mock.executeTool("TaskOutput", { task_id: "1", block: false, timeout: 30000 });
+    expect(objectResult.content[0].text).toContain('{"summary":"done"}');
+
+    await mock.executeTool("TaskUpdate", { taskId: "1", metadata: { result: 0 } });
+    const numericResult = await mock.executeTool("TaskOutput", { task_id: "1", block: false, timeout: 30000 });
+    expect(numericResult.content[0].text).toContain("\n\n0");
+  });
+
+  it("resolves a blocking wait when the agent completes", async () => {    await launchAgentTask(mock);
     const pending = mock.executeTool("TaskOutput", { task_id: "1", block: true, timeout: 5000 });
     await flush();
     mock.emitEvent("subagents:completed", { id: "agent-1", result: "done" });
