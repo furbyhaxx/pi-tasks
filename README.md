@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 ## Install
 
-Requires pi 0.85.1 or newer.
+Requires pi 0.87.0 or newer.
 
 ```bash
 pi install npm:@tintinweb/pi-tasks

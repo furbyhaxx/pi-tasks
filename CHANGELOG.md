@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the supported pi floor and the `@earendil-works/pi-*` development pins to 0.87.0. The extension's handlers are unaffected by the 0.87 breaking changes — `turn_end` still carries the assistant message, `context` only appends, and the `agent_settled` handler requests no continuation — so no behavior changed.
+
 ## [0.9.1] - 2026-09-17
 
 ### Fixed
