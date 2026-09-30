@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { sortTasks, type TaskSortOrder } from "./task-sort.js";
@@ -157,6 +157,24 @@ export interface TaskGroupSummary {
   blockers: string[];
 }
 
+/** Identity of a file version. The store writes through a temp file and renames, so
+ *  another session's write replaces the inode even when mtime and size land in the
+ *  same filesystem tick. */
+type FileStamp = { mtimeMs: number; size: number; ino: number };
+
+function statFile(filePath: string): FileStamp | undefined {
+  try {
+    const stat = statSync(filePath);
+    return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameStamp(a: FileStamp, b: FileStamp): boolean {
+  return a.mtimeMs === b.mtimeMs && a.size === b.size && a.ino === b.ino;
+}
+
 export class TaskStore {
   private filePath: string | undefined;
   private lockPath: string | undefined;
@@ -164,6 +182,9 @@ export class TaskStore {
   private nextGroupId = 1;
   private tasks = new Map<string, Task>();
   private groups = new Map<string, TaskGroup>();
+  /** The file version the in-memory state was parsed from; null when the file was
+   *  last seen absent. Undefined means nothing has been parsed yet. */
+  private diskStamp: FileStamp | null | undefined;
 
   constructor(listIdOrPath?: string) {
     if (!listIdOrPath) return;
@@ -175,13 +196,22 @@ export class TaskStore {
 
   private load(): void {
     if (!this.filePath) return;
-    if (!existsSync(this.filePath)) {
+    // Every read goes through here, including the render path: the widget is drawn
+    // many times a second, so the parse is kept and re-validated by one stat rather
+    // than re-read and re-parsed per call.
+    const stamp = statFile(this.filePath);
+    if (!stamp) {
+      this.diskStamp = null;
       this.nextId = 1;
       this.nextGroupId = 1;
       this.tasks.clear();
       this.groups.clear();
       return;
     }
+    if (this.diskStamp && sameStamp(this.diskStamp, stamp)) return;
+    // Marked fresh before parsing: an unreadable or malformed file retains the
+    // current state either way, and re-parsing it on every call would not help.
+    this.diskStamp = stamp;
     try {
       const data: unknown = JSON.parse(readFileSync(this.filePath, "utf-8"));
       if (!data || typeof data !== "object") return;
@@ -230,6 +260,9 @@ export class TaskStore {
     const tmpPath = `${this.filePath}.tmp`;
     writeFileSync(tmpPath, JSON.stringify(data, null, 2));
     renameSync(tmpPath, this.filePath);
+    // Our own write is the newest version on disk; stamping it here keeps the next
+    // read from re-parsing what we just wrote.
+    this.diskStamp = statFile(this.filePath) ?? null;
   }
 
   private mutate<T>(fn: () => T): T {
@@ -757,6 +790,7 @@ export class TaskStore {
       this.load();
       if (this.tasks.size > 0 || this.groups.size > 0) return false;
       try { unlinkSync(this.filePath); } catch { /* already absent */ }
+      this.diskStamp = null;
       return true;
     } finally {
       releaseLock(this.lockPath, token);

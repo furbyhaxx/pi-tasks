@@ -338,7 +338,15 @@ export default function (pi: ExtensionAPI) {
   // job extension binding after pi-tasks is still found; its helpers are what a
   // `/tasks` menu entry will call once the frontend adds one.
   const jobsRpc = createBackgroundJobsRpc(pi.events);
-  pi.on("session_shutdown", () => jobsRpc.dispose());
+  // The widget's spinner timer is the only thing re-reading the task file and
+  // re-rendering the whole conversation on its own, so it has to die with the
+  // session that started it. On reload the factory re-runs and orphans this
+  // instance entirely — without this its interval would keep firing forever.
+  // On new/resume/fork the same instance is reused and session_start re-arms it.
+  pi.on("session_shutdown", () => {
+    jobsRpc.dispose();
+    widget.dispose();
+  });
 
   /** Build a prompt for a task being executed by a subagent.
    *  Injects completed dependency results so cascaded agents have context from prerequisites.

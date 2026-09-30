@@ -112,6 +112,7 @@ export class TaskWidget {
       this.ensureTimer();
     } else if (taskId) {
       this.activeTaskIds.delete(taskId);
+      this.metrics.delete(taskId);
     }
     this.update();
   }
@@ -159,11 +160,17 @@ export class TaskWidget {
     const glyphs = resolveTaskGlyphs(this.config.glyphs);
     const allTasks = this.store.list(sortOrder);
     const groups = orderTaskGroups(this.store.listGroups());
+    // Lookups below resolve against these rather than through the store: every
+    // store call re-checks the task file, and one frame walks every visible task's
+    // prerequisites. `allTasks` holds every task, so it answers both the group
+    // membership and the blocker lookups the store would.
+    const groupIds = new Set(groups.map(group => group.id));
+    const tasksById = new Map(allTasks.map(task => [task.id, task]));
     const visibleTasks = allTasks.filter(task => !task.hidden);
     const tasks = groups.length > 0
       ? [
           ...groups.flatMap(group => visibleTasks.filter(task => task.groupId === group.id)),
-          ...visibleTasks.filter(task => !task.groupId || !this.store.getGroup(task.groupId)),
+          ...visibleTasks.filter(task => !task.groupId || !groupIds.has(task.groupId)),
         ]
       : visibleTasks;
     const w = tui.terminal.columns;
@@ -316,7 +323,7 @@ export class TaskWidget {
       const suffix = task.status === "pending"
         ? blockerSuffix([
             ...blockingGroupIds(task.groupId),
-            ...task.blockedBy.filter(id => this.store.get(id)?.status !== "completed").map(id => `#${id}`),
+            ...task.blockedBy.filter(id => tasksById.get(id)?.status !== "completed").map(id => `#${id}`),
           ])
         : "";
       const indent = groups.length > 0 ? "    " : "  ";

@@ -521,6 +521,33 @@ describe("TaskWidget", () => {
     expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
   });
 
+  it("stops re-registering the widget after dispose", () => {
+    store.create("Task", "Desc");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+    widget.dispose();
+
+    // The timer is the only thing that can put the widget back; if it outlives
+    // dispose, every tick re-reads the task file and re-renders the conversation.
+    vi.advanceTimersByTime(1_500);
+    expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
+  });
+
+  it("forgets a deactivated task's elapsed time", () => {
+    store.create("Task", "Desc", "Working");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+    vi.advanceTimersByTime(90_000);
+
+    widget.setActiveTask("1", false);
+    widget.setActiveTask("1", true);
+
+    // A task activated again starts its clock over instead of inheriting the
+    // previous run's metrics.
+    const lines = renderWidget(ui.state);
+    expect(lines[1]).toContain("(0s)");
+  });
+
   it("uses subject as fallback when no activeForm", () => {
     store.create("My Subject", "Desc");
     store.update("1", { status: "in_progress" });
