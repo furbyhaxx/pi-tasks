@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-30
+
+### Fixed
+
+- **The tasks widget no longer re-reads and re-parses the whole task file on every rendered frame.** `buildWidgetLines` is a render callback that reaches the store several times per frame, and every store entry point began with `load()`, so each frame paid an `existsSync` + `readFileSync` + `JSON.parse` + full re-normalize — repeated for the task list, the group list, each group's summary, and again for every blocker of every visible pending task. `load()` now re-parses only when the file's `{mtimeMs, size, ino}` differs from the stamp the in-memory state was built from, and `save()` re-stamps after its rename. On this host's largest real task file (248,742 bytes, 65 tasks) the file opens per frame drop from 2,415 to 5 with zero task-file reads, a frame's `update()` costs 0.085 ms against the render's 0.56 ms, and 50 consecutive renders cause 0 file reads. Other processes' atomic-rename writes are still picked up, including the hostile cases where only the inode or only the size changed.
+
+- **Blocker and group lookups resolve against the lists the frame already loaded** instead of calling into the store once per blocker per visible pending task.
+
+- **`session_shutdown` now disposes the widget.** Shutdown disposed only the background-jobs client, so the widget's 150 ms interval outlived the session and kept re-rendering a dead widget for the rest of the process' life.
+
 ### Changed
 
 - Raised the supported pi floor and the `@earendil-works/pi-*` development pins to 0.87.0. The extension's handlers are unaffected by the 0.87 breaking changes — `turn_end` still carries the assistant message, `context` only appends, and the `agent_settled` handler requests no continuation — so no behavior changed.
